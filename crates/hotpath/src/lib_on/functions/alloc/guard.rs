@@ -279,6 +279,22 @@ pub fn measure_block_await<F: std::future::IntoFuture, const N: usize>(
     }
 }
 
+struct PollScopes<'a, 'guard, const N: usize>(&'a mut [&'guard mut MeasurementGuardSync; N]);
+
+impl<const N: usize> Drop for PollScopes<'_, '_, N> {
+    fn drop(&mut self) {
+        let _suspend = crate::lib_on::SuspendAllocTracking::new();
+        for guard in self.0.iter_mut().rev() {
+            if !guard.skipped && !guard.paused {
+                let (bytes, count) = pop_alloc_stack();
+                guard.bytes += bytes;
+                guard.count += count;
+                guard.paused = true;
+            }
+        }
+    }
+}
+
 impl<F: std::future::Future, const N: usize> std::future::Future
     for MeasuredAwait<F, [&mut MeasurementGuardSync; N]>
 {
@@ -289,7 +305,8 @@ impl<F: std::future::Future, const N: usize> std::future::Future
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = self.project();
-        for guard in &mut *this.scopes {
+        let scopes = PollScopes(this.scopes);
+        for guard in &mut *scopes.0 {
             if guard.paused {
                 push_alloc_stack();
                 let tid = crate::tid::current_tid();
@@ -300,14 +317,9 @@ impl<F: std::future::Future, const N: usize> std::future::Future
         }
 
         let result = this.inner.poll(cx);
-        if result.is_pending() {
-            let _suspend = crate::lib_on::SuspendAllocTracking::new();
-            for guard in this.scopes.iter_mut().rev().filter(|guard| !guard.skipped) {
-                let (bytes, count) = pop_alloc_stack();
-                guard.bytes += bytes;
-                guard.count += count;
-                guard.paused = true;
-            }
+        if result.is_ready() {
+            // The enclosing block is still executing and owns the active frames.
+            std::mem::forget(scopes);
         }
         result
     }
@@ -675,6 +687,38 @@ mod tests {
             crate::functions::alloc::core::ALLOCATIONS.with(|s| s.depth.get()),
             0
         );
+    }
+
+    #[test]
+    fn measured_await_releases_borrowed_frames_on_unwind() {
+        use std::future::{poll_fn, Future};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::task::{Context, Poll, Waker};
+
+        use crate::functions::alloc::core::{track_alloc, ALLOCATIONS};
+        use crate::functions::alloc::guard::{measure_block_await, MeasurementGuardSync};
+
+        let mut guard = MeasurementGuardSync::new("unwinding await", false, false);
+        {
+            let mut pending = true;
+            let inner = poll_fn(|_| {
+                if std::mem::take(&mut pending) {
+                    track_alloc(8);
+                    Poll::<()>::Pending
+                } else {
+                    track_alloc(16);
+                    panic!("poll failed");
+                }
+            });
+            let mut future = std::pin::pin!(measure_block_await(inner, [&mut guard]));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert!(catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut cx))).is_err());
+        }
+        assert_eq!(ALLOCATIONS.with(|stack| stack.depth.get()), 0);
+        assert!(guard.paused);
+        assert_eq!((guard.bytes, guard.count), (24, 2));
+        std::thread::spawn(move || drop(guard)).join().unwrap();
     }
 
     #[test]

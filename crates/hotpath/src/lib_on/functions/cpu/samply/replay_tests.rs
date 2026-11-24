@@ -83,7 +83,7 @@ pub extern "C" fn replay_call(value: u64) -> u64 {
         } else {
             library.clone()
         };
-        let loader = addr2line::Loader::new(debug).unwrap();
+        let loader = addr2line::Loader::new(&debug).unwrap();
         let pc = (pc..pc + entry.size().max(128))
             .find(|&address| {
                 let mut frames = loader.find_frames(address).unwrap();
@@ -99,15 +99,35 @@ pub extern "C" fn replay_call(value: u64) -> u64 {
                 false
             })
             .expect("fixture must have a real DWARF inline frame");
+        use crate::functions::cpu::samply::{InlineSymbols, MAX_INLINE_ADDRESSES};
+
+        let mut inline = InlineSymbols::default();
+        inline
+            .by_address
+            .extend((0..MAX_INLINE_ADDRESSES).map(|i| (u64::MAX - i as u64, None)));
+        let labels = inline.lookup(
+            debug.to_str().unwrap(),
+            pc,
+            0,
+            None,
+            &HashMap::from([(LEAF, LEAF)]),
+        );
+        assert_eq!(labels, &[LEAF]);
+        assert_eq!(inline.by_address.len(), MAX_INLINE_ADDRESSES);
         (pc, LEAF)
     };
-    let code_id = object.mach_uuid().unwrap().map(|uuid| {
-        let mut hex = String::new();
-        for byte in uuid {
-            write!(hex, "{byte:02x}").unwrap();
-        }
-        hex
-    });
+    let uuid = object.mach_uuid().unwrap();
+    let code_id = uuid
+        .as_ref()
+        .map(|uuid| uuid.as_slice())
+        .or_else(|| object.build_id().unwrap())
+        .map(|id| {
+            let mut hex = String::new();
+            for byte in id {
+                write!(hex, "{byte:02x}").unwrap();
+            }
+            hex
+        });
 
     let pid = std::process::id();
     let thread = serde_json::json!({
@@ -148,5 +168,19 @@ pub extern "C" fn replay_call(value: u64) -> u64 {
             .collect();
         assert_eq!(rows, expected_rows);
     }
+    let mut profile = profile;
+    let mut thread = profile["threads"][2].clone();
+    thread["samples"]["threadCPUDelta"] = serde_json::json!([i64::MAX, 0, 0, 0]);
+    profile["threads"] = serde_json::json!([&thread, &thread, &thread]);
+    let profile = serde_json::from_value(profile).unwrap();
+    let names = HashMap::from([(ENTRY, 1), (LEAF, 2)]);
+    let report = build_cpu_report("replay", &path, &profile, &names).unwrap();
+    assert_eq!(
+        (report.total_samples, report.attributed_samples),
+        (u64::MAX, u64::MAX),
+    );
+    assert_eq!(report.stats.len(), expected_rows.len());
+    assert!(report.stats.iter().all(|row| row.samples == u64::MAX));
+
     fs::remove_dir_all(dir).unwrap();
 }

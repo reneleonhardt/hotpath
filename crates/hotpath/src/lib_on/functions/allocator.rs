@@ -104,7 +104,7 @@ mod tests {
 
     unsafe impl GlobalAlloc for Limited {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if layout.size() == 8 {
+            if matches!(layout.size(), 8 | 16) {
                 unsafe { System.alloc(layout) }
             } else {
                 std::ptr::null_mut()
@@ -122,7 +122,7 @@ mod tests {
         push_alloc_stack();
         unsafe {
             for (size, zeroed) in [(8, false), (8, true), (32, false), (64, true)] {
-                let layout = Layout::from_size_align(size, 1).unwrap();
+                let layout = Layout::from_size_align(size, 8).unwrap();
                 let ptr = if zeroed {
                     alloc.alloc_zeroed(layout)
                 } else {
@@ -133,17 +133,20 @@ mod tests {
                     if zeroed {
                         assert_eq!(ptr.read(), 0);
                     }
-                    ptr.write(0xa5);
+                    let payload = [0xa5; 8];
+                    ptr.cast::<[u8; 8]>().write(payload);
                     assert!(alloc.realloc(ptr, layout, 32).is_null());
-                    assert_eq!(ptr.read(), 0xa5);
+                    assert_eq!(ptr.cast::<[u8; 8]>().read(), payload);
 
-                    let new_ptr = alloc.realloc(ptr, layout, 8);
+                    let grown = Layout::from_size_align(16, layout.align()).unwrap();
+                    let new_ptr = alloc.realloc(ptr, layout, grown.size());
                     assert!(!new_ptr.is_null());
-                    assert_eq!(new_ptr.read(), 0xa5);
-                    alloc.dealloc(new_ptr, layout);
+                    assert!(new_ptr.cast::<u64>().is_aligned());
+                    assert_eq!(new_ptr.cast::<[u8; 8]>().read(), payload);
+                    alloc.dealloc(new_ptr, grown);
                 }
             }
         }
-        assert_eq!(pop_alloc_stack(), (32, 4));
+        assert_eq!(pop_alloc_stack(), (48, 4));
     }
 }

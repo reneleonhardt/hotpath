@@ -45,7 +45,7 @@ pub fn register_block_label(label: &'static str, location: &'static Location) {
 }
 
 /// Call sites usually have one or two labels. Keep those lock-free after
-/// registration and use a set for call sites with more labels.
+/// registration and use a bounded set for call sites with more labels.
 #[derive(Default)]
 #[doc(hidden)]
 pub struct BlockLabels {
@@ -59,6 +59,8 @@ thread_local! {
 }
 
 impl BlockLabels {
+    const MAX_EXTRA: usize = 32;
+
     pub const fn new() -> Self {
         Self {
             common: [const { OnceLock::new() }; 2],
@@ -101,7 +103,13 @@ impl BlockLabels {
         }
         let _suspend = crate::lib_on::SuspendAllocTracking::new();
         let mut labels = labels.write().unwrap();
-        if labels.insert(label) {
+        if labels.len() == Self::MAX_EXTRA {
+            let known = labels.contains(label);
+            drop(labels);
+            if !known {
+                register_block_label(label, location);
+            }
+        } else if labels.insert(label) {
             register_block_label(label, location);
         }
     }
@@ -266,6 +274,26 @@ mod tests {
     use crate::lib_on::locations::{
         lookup_location, normalize_file_path, register_location, Location,
     };
+
+    #[test]
+    fn block_label_cache_stops_growing_but_keeps_registering_labels() {
+        use crate::lib_on::locations::BlockLabels;
+
+        static LOC: Location = Location {
+            file: "src/blocks.rs",
+            line: 1,
+            column: 1,
+        };
+        let cache = BlockLabels::new();
+        let labels = "block_cap_a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff gg hh block_cap_last";
+        for label in labels.split_whitespace() {
+            cache.register(label, &LOC);
+        }
+        let extra = cache.extra.get().unwrap().read().unwrap();
+        assert_eq!(extra.len(), BlockLabels::MAX_EXTRA);
+        assert!(!extra.contains("block_cap_last"));
+        assert_eq!(lookup_location("block_cap_last").unwrap().file, LOC.file);
+    }
 
     #[test]
     fn relative_paths_pass_through() {

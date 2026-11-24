@@ -111,10 +111,9 @@ fn build_cpu_report(
                 let func_idx = frame_func.get(frame_idx).copied();
                 let lib_opt = func_idx
                     .and_then(|fi| func_resource.get(fi).copied())
-                    .filter(|r| *r >= 0)
-                    .and_then(|r| resource_lib.get(r as usize).copied().flatten())
-                    .filter(|l| *l >= 0)
-                    .map(|l| l as usize);
+                    .and_then(|r| usize::try_from(r).ok())
+                    .and_then(|r| resource_lib.get(r).copied().flatten())
+                    .and_then(|l| usize::try_from(l).ok());
 
                 if let Some(lib) =
                     lib_opt.filter(|&lib| address >= 0 && (process_found || Some(lib) == primary))
@@ -160,7 +159,8 @@ fn build_cpu_report(
                             if inclusive {
                                 matched.insert(sym);
                             } else {
-                                *sample_counts.entry(sym).or_insert(0) += weight;
+                                let count = sample_counts.entry(sym).or_default();
+                                *count = count.saturating_add(weight);
                                 credited = true;
                                 break;
                             }
@@ -178,20 +178,21 @@ fn build_cpu_report(
 
             if inclusive && !matched.is_empty() {
                 for sym in matched.drain() {
-                    *sample_counts.entry(sym).or_insert(0) += weight;
+                    let count = sample_counts.entry(sym).or_default();
+                    *count = count.saturating_add(weight);
                 }
-                attributed_samples += weight;
+                attributed_samples = attributed_samples.saturating_add(weight);
             } else if credited {
-                attributed_samples += weight;
+                attributed_samples = attributed_samples.saturating_add(weight);
             }
         };
-        total_samples += visit_sample_stacks(
+        total_samples = total_samples.saturating_add(visit_sample_stacks(
             &thread.samples.stack,
             thread.samples.weights(sample_unit),
             stack_frame.len(),
             &mut weights_by_root,
             attribute,
-        );
+        ));
     }
 
     let mut stats: Vec<CpuFunctionStats> = sample_counts
@@ -520,6 +521,9 @@ fn build_symbol_index(
 type InlineLabels = Option<Arc<[&'static str]>>;
 
 #[cfg(feature = "hotpath-cpu-inline")]
+const MAX_INLINE_ADDRESSES: usize = 4096;
+
+#[cfg(feature = "hotpath-cpu-inline")]
 struct DirectInlineSymbols {
     context: addr2line::Context<gimli::EndianArcSlice<gimli::RunTimeEndian>>,
     by_address: HashMap<u64, InlineLabels>,
@@ -578,7 +582,6 @@ impl DirectInlineSymbols {
             return None;
         };
         let names = collect_inline_labels(frames.ok()?, labels, demangled).ok()?;
-        const MAX_INLINE_ADDRESSES: usize = 4096;
         if self.by_address.len() < MAX_INLINE_ADDRESSES {
             self.by_address.insert(address, names.clone());
         }
@@ -591,6 +594,7 @@ impl DirectInlineSymbols {
 struct InlineSymbols {
     fallback: Option<Option<addr2line::Loader>>,
     by_address: HashMap<u64, InlineLabels>,
+    uncached: InlineLabels,
     demangled: String,
 }
 
@@ -604,29 +608,38 @@ impl InlineSymbols {
         direct: Option<&Mutex<DirectInlineSymbols>>,
         labels: &HashMap<&'static str, &'static str>,
     ) -> &[&'static str] {
-        self.by_address
-            .entry(address)
-            .or_insert_with(|| {
-                let address = base.checked_add(address)?;
-                if let Some(names) = direct.and_then(|direct| {
-                    direct
-                        .try_lock()
-                        .ok()?
-                        .lookup(address, labels, &mut self.demangled)
-                }) {
-                    return names;
-                }
-                let loader = self
-                    .fallback
-                    .get_or_insert_with(|| addr2line::Loader::new(path).ok())
-                    .as_ref()?;
-                let frames = loader.find_frames(address).ok()?;
-                collect_inline_labels(frames, labels, &mut self.demangled)
-                    .ok()
-                    .flatten()
-            })
-            .as_deref()
-            .unwrap_or_default()
+        use std::collections::hash_map::Entry;
+
+        let full = self.by_address.len() == MAX_INLINE_ADDRESSES;
+        let entry = match self.by_address.entry(address) {
+            Entry::Occupied(entry) => return entry.into_mut().as_deref().unwrap_or_default(),
+            Entry::Vacant(entry) => entry,
+        };
+        let names = (|| {
+            let address = base.checked_add(address)?;
+            if let Some(names) = direct.and_then(|direct| {
+                direct
+                    .try_lock()
+                    .ok()?
+                    .lookup(address, labels, &mut self.demangled)
+            }) {
+                return names;
+            }
+            let loader = self
+                .fallback
+                .get_or_insert_with(|| addr2line::Loader::new(path).ok())
+                .as_ref()?;
+            let frames = loader.find_frames(address).ok()?;
+            collect_inline_labels(frames, labels, &mut self.demangled)
+                .ok()
+                .flatten()
+        })();
+        if full {
+            self.uncached = names;
+            self.uncached.as_deref().unwrap_or_default()
+        } else {
+            entry.insert(names).as_deref().unwrap_or_default()
+        }
     }
 }
 
@@ -760,12 +773,12 @@ fn visit_sample_stacks(
     weights_by_root: &mut Vec<Option<u64>>,
     mut attribute: impl FnMut(Option<usize>, u64),
 ) -> u64 {
-    let mut total = 0;
+    let mut total = 0_u64;
     let roots = stacks.iter().enumerate().map(|(i, &root)| {
         let weight = weights
             .and_then(|weights| weights.get(i))
             .map_or(1, |&weight| weight.max(0) as u64);
-        total += weight;
+        total = total.saturating_add(weight);
         (root, weight)
     });
 
@@ -774,7 +787,8 @@ fn visit_sample_stacks(
         weights_by_root.resize(stack_count, None);
         for (root, weight) in roots {
             if let Some(cell) = root.and_then(|root| weights_by_root.get_mut(root)) {
-                *cell.get_or_insert(0) += weight;
+                let count = cell.get_or_insert(0);
+                *count = count.saturating_add(weight);
             }
         }
         for (root, weight) in weights_by_root.drain(..).enumerate() {
@@ -894,6 +908,24 @@ mod tests {
         );
         std::fs::remove_file(path).unwrap();
         assert_eq!(report.unwrap().caller_name, "run");
+    }
+
+    #[test]
+    fn caps_weight_totals_without_wrapping() {
+        use crate::lib_on::functions::cpu::samply::visit_sample_stacks;
+
+        let mut scratch = Vec::new();
+        let mut root_total = 0;
+        let total = visit_sample_stacks(
+            &[Some(0); 3],
+            Some(&[i64::MAX; 3]),
+            1,
+            &mut scratch,
+            |_, weight| {
+                root_total = weight;
+            },
+        );
+        assert_eq!((total, root_total), (u64::MAX, u64::MAX));
     }
 
     #[test]
