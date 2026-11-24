@@ -15,6 +15,7 @@ hotpath = ["dep:proc-macro2", "dep:quote", "dep:syn"]
 hotpath-alloc = ["hotpath", "syn/visit-mut"]
 hotpath-alloc-meta = []
 hotpath-cpu = ["hotpath"]
+hotpath-cpu-inline = ["hotpath-cpu"]
 hotpath-callgrind = ["hotpath"]
 
 [lib]

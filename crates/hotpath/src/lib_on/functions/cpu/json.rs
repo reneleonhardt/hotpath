@@ -63,6 +63,8 @@ pub(crate) struct Lib {
     pub(crate) path: Option<String>,
     #[serde(rename = "debugPath", default)]
     pub(crate) debug_path: Option<String>,
+    #[serde(rename = "codeId", default)]
+    pub(crate) code_id: Option<String>,
 }
 
 #[derive(Deserialize)]

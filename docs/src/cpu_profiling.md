@@ -119,9 +119,11 @@ By default attribution is exclusive: each CPU sample is credited to the innermos
 
 Standard CPU profilers sometimes miss top bottleneck functions because the compiler implicitly inlines small or hot functions. Once a function is inlined, its symbol disappears from the binary and its samples get attributed to the caller, hiding it from the report.
 
-Under the `hotpath-cpu` feature, `#[hotpath::measure]` strip any user-provided `#[inline(...)]` attribute and inject `#[inline(never)]` instead. This forces the function to retain its own symbol so CPU samples attribute correctly.
+By default, with `hotpath-cpu`, `#[hotpath::measure]` strips any user-provided `#[inline(...)]` attribute and injects `#[inline(never)]`. This forces the function to retain its own symbol so CPU samples attribute correctly.
 
-To disable this rewrite, set `HOTPATH_KEEP_INLINE=1`. The variable is read at proc-macro expansion time, so touch the source file or run `cargo clean` after toggling it.
+Enable `hotpath-cpu-inline` to preserve compiler inlining and attribute inline frames using DWARF when Hotpath builds the report. Build with debug information and keep the matching debug files with the executable. On macOS, Hotpath can read an adjacent dSYM bundle.
+
+With `hotpath-cpu` alone, you can disable the rewrite by setting `HOTPATH_KEEP_INLINE=1`. The variable is read at proc-macro expansion time, so touch the source file or run `cargo clean` after toggling it.
 
 ## Symbol attribution for impl functions
 

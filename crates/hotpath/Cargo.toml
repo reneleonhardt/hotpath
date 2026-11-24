@@ -71,6 +71,7 @@ diesel = ["dep:diesel"]
 threads = []
 dev = ["dep:time", "time/formatting", "time/local-offset"]
 hotpath-cpu = ["hotpath", "hotpath-macros/hotpath-cpu", "dep:object", "dep:rustc-demangle", "dep:flate2"]
+hotpath-cpu-inline = ["hotpath-cpu", "hotpath-macros/hotpath-cpu-inline", "dep:addr2line"]
 hotpath-callgrind = ["hotpath", "hotpath-macros/hotpath-callgrind"]
 hotpath-mcp = ["hotpath", "dep:rmcp", "dep:tokio", "tokio/rt", "tokio/net", "dep:axum", "axum/http1", "axum/tokio", "dep:tokio-util", "dep:schemars"]
 hotpath-prometheus = ["hotpath", "dep:prost"]
@@ -130,6 +131,7 @@ tower-layer = { version = "0.3", optional = true }
 tower-service = { version = "0.3", optional = true }
 tokio-util = { version = "0.7", optional = true }
 hotpath-meta = { workspace = true, optional = true }
+addr2line = { version = "0.24", default-features = false, features = ["loader"], optional = true }
 object = { version = "0.36", default-features = false, features = ["read", "std"], optional = true }
 rustc-demangle = { version = "0.1.24", optional = true }
 flate2 = { version = "1", optional = true }

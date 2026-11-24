@@ -10,7 +10,8 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-static KEEP_INLINE: LazyLock<bool> = LazyLock::new(|| env_flag("HOTPATH_KEEP_INLINE"));
+static KEEP_INLINE: LazyLock<bool> =
+    LazyLock::new(|| cfg!(feature = "hotpath-cpu-inline") || env_flag("HOTPATH_KEEP_INLINE"));
 
 /// Upper bound on configured percentiles. Kept in sync with `MAX_PERCENTILES`
 /// in the `hotpath` crate, which enforces the same limit on the builder path.
