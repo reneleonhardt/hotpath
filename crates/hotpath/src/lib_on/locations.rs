@@ -53,6 +53,11 @@ pub struct BlockLabels {
     extra: OnceLock<std::sync::RwLock<std::collections::HashSet<&'static str>>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static BLOCK_LABEL_COLD_LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 impl BlockLabels {
     pub const fn new() -> Self {
         Self {
@@ -74,6 +79,8 @@ impl BlockLabels {
 
     #[cold]
     fn register_uncached(&self, label: &'static str, location: &'static Location) {
+        #[cfg(test)]
+        BLOCK_LABEL_COLD_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
         for slot in &self.common {
             let cached = *slot.get_or_init(|| {
                 register_block_label(label, location);
@@ -246,6 +253,14 @@ mod tests {
             assert!(crate::functions::is_labeled(label));
         }
         assert_eq!(cache.extra.get().unwrap().read().unwrap().len(), 1);
+        let before = crate::lib_on::locations::BLOCK_LABEL_COLD_LOOKUPS.get();
+        for label in [long, short].into_iter().cycle().take(100) {
+            cache.register(label, &LOC);
+        }
+        assert_eq!(
+            crate::lib_on::locations::BLOCK_LABEL_COLD_LOOKUPS.get(),
+            before
+        );
     }
 
     use crate::lib_on::locations::{

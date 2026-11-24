@@ -782,6 +782,9 @@ fn visit_sample_stacks(
     total
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod replay_tests;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
