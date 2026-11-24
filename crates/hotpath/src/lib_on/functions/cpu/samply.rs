@@ -1,7 +1,7 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -55,9 +55,10 @@ pub(crate) fn build_cpu_report_from_path(
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_os_string()));
     if primary_lib_name.is_none() {
-        warn!("cpu report: could not resolve current_exe; CPU report will be empty");
+        warn!("cpu report: could not resolve current_exe; only the current process will be attributed");
     }
 
+    let mut libraries: Vec<_> = (0..profile.libs.len()).map(|_| None).collect();
     let primary = profile.libs.iter().enumerate().find_map(|(i, lib)| {
         let is_primary = primary_lib_name.as_deref().is_some_and(|name| {
             lib.path
@@ -68,20 +69,10 @@ pub(crate) fn build_cpu_report_from_path(
         if !is_primary {
             return None;
         }
-        let (path, index) = build_lib_index(lib, &match_to_display)?;
-        Some((i, path, index))
+        let entry = libraries[i].insert(ReportLibrary::load(lib, &match_to_display));
+        entry.as_ref().map(|_| i)
     });
-    let total_matches: usize = primary
-        .as_ref()
-        .map(|(_, _, index)| index.ranges.len())
-        .unwrap_or(0);
 
-    #[cfg(feature = "hotpath-cpu-inline")]
-    let mut inline = primary
-        .as_ref()
-        .and_then(|(_, path, index)| InlineSymbols::new(path, index.image_base, &match_to_display));
-
-    let sample_unit = profile.sample_unit();
     let mut sample_counts: HashMap<&'static str, u64> = HashMap::new();
     let mut total_samples: u64 = 0;
     let mut attributed_samples: u64 = 0;
@@ -89,7 +80,9 @@ pub(crate) fn build_cpu_report_from_path(
     let mut matched = HashSet::new();
     let mut weights_by_root = Vec::new();
 
-    for thread in &profile.threads {
+    let (threads, process_found) = profile.profiled_threads(std::process::id());
+    let sample_unit = profile.sample_unit(threads.clone());
+    for thread in threads {
         let prefix = &thread.stack_table.prefix;
         let stack_frame = &thread.stack_table.frame;
         let frame_addr = &thread.frame_table.address;
@@ -114,33 +107,45 @@ pub(crate) fn build_cpu_report_from_path(
                     .filter(|l| *l >= 0)
                     .map(|l| l as usize);
 
-                if address >= 0 {
-                    if let (Some(lib_idx), Some((primary_idx, _, primary_lib))) =
-                        (lib_opt, primary.as_ref())
-                    {
-                        if lib_idx == *primary_idx {
-                            let address = address as u64;
-                            let symbol = primary_lib.lookup(address);
-                            #[cfg(feature = "hotpath-cpu-inline")]
-                            let symbol = if let Some(inline) = &mut inline {
-                                let labels = inline.lookup(address);
-                                if inclusive {
-                                    matched.extend(labels.iter().copied());
-                                    symbol
-                                } else {
-                                    labels.first().copied().or(symbol)
-                                }
-                            } else {
+                if let Some(lib) =
+                    lib_opt.filter(|&lib| address >= 0 && (process_found || Some(lib) == primary))
+                {
+                    if let Some(library) = libraries.get_mut(lib).and_then(|entry| {
+                        entry
+                            .get_or_insert_with(|| {
+                                ReportLibrary::load(&profile.libs[lib], &match_to_display)
+                            })
+                            .as_mut()
+                    }) {
+                        let address = address as u64;
+                        let eligible = |name: &&str| {
+                            Some(lib) == primary
+                                || label_to_symbol
+                                    .get(*name)
+                                    .copied()
+                                    .unwrap_or(*name)
+                                    .contains("::")
+                        };
+                        let symbol = library.index.lookup(address).filter(eligible);
+                        #[cfg(feature = "hotpath-cpu-inline")]
+                        let symbol = if let Some(inline) = &mut library.inline {
+                            let labels = inline.lookup(address, &match_to_display);
+                            if inclusive {
+                                matched.extend(labels.iter().copied().filter(eligible));
                                 symbol
-                            };
-                            if let Some(sym) = symbol {
-                                if inclusive {
-                                    matched.insert(sym);
-                                } else {
-                                    *sample_counts.entry(sym).or_insert(0) += weight;
-                                    credited = true;
-                                    break;
-                                }
+                            } else {
+                                labels.iter().copied().find(eligible).or(symbol)
+                            }
+                        } else {
+                            symbol
+                        };
+                        if let Some(sym) = symbol {
+                            if inclusive {
+                                matched.insert(sym);
+                            } else {
+                                *sample_counts.entry(sym).or_insert(0) += weight;
+                                credited = true;
+                                break;
                             }
                         }
                     }
@@ -185,6 +190,12 @@ pub(crate) fn build_cpu_report_from_path(
 
     stats.sort_by(|a, b| b.samples.cmp(&a.samples).then_with(|| a.name.cmp(b.name)));
 
+    let total_matches: usize = libraries
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|library| library.index.ranges.len())
+        .sum();
     info!(
         "cpu report: total_samples={total_samples} attributed_samples={attributed_samples} matched_symbols={total_matches} stats_rows={}",
         stats.len()
@@ -267,10 +278,9 @@ fn matches_code_id(actual: Option<&[u8]>, recorded: Option<&str>) -> bool {
 type FileStamp = (u64, u64, u64, i64, i64);
 
 #[cfg(unix)]
-fn file_stamp(file: &File) -> Option<FileStamp> {
+fn file_stamp(metadata: &Metadata) -> Option<FileStamp> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = file.metadata().ok()?;
     Some((
         metadata.dev(),
         metadata.ino(),
@@ -281,50 +291,76 @@ fn file_stamp(file: &File) -> Option<FileStamp> {
 }
 
 #[cfg(not(unix))]
-fn file_stamp(_: &File) -> Option<FileStamp> {
+fn file_stamp(_: &Metadata) -> Option<FileStamp> {
     None
 }
 
-struct CachedSymbolIndex {
-    stamp: FileStamp,
+#[derive(Default)]
+struct CachedSymbols {
     labels: HashMap<&'static str, &'static str>,
-    index: Arc<LibSymbolIndex>,
+    indexes: VecDeque<(FileStamp, Option<Arc<LibSymbolIndex>>)>,
 }
 
 #[derive(Default)]
-struct SymbolCache(Mutex<Option<CachedSymbolIndex>>);
+struct SymbolCache(Mutex<CachedSymbols>);
 
 impl SymbolCache {
     fn index(
         &self,
-        mut file: File,
+        path: &Path,
         labels: &HashMap<&'static str, &'static str>,
         recorded_code_id: Option<&str>,
     ) -> Option<Arc<LibSymbolIndex>> {
-        let stamp = file_stamp(&file);
-        if let Ok(cache) = self.0.lock() {
-            if let Some(cached) = cache.as_ref() {
-                if Some(cached.stamp) == stamp && &cached.labels == labels {
-                    return matches_code_id(cached.index.code_id.as_deref(), recorded_code_id)
-                        .then(|| Arc::clone(&cached.index));
+        let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let stamp = file_stamp(&metadata);
+        if let (Some(stamp), Ok(mut cache)) = (stamp, self.0.lock()) {
+            if &cache.labels == labels {
+                if let Some(pos) = cache.indexes.iter().position(|(saved, _)| *saved == stamp) {
+                    let index = cache.indexes[pos].1.as_ref();
+                    if index.is_some_and(|index| {
+                        !matches_code_id(index.code_id.as_deref(), recorded_code_id)
+                    }) {
+                        return None;
+                    }
+                    let entry = cache.indexes.remove(pos)?;
+                    let index = entry.1.clone();
+                    cache.indexes.push_back(entry);
+                    return index;
                 }
             }
         }
 
+        let mut file = File::open(path).ok()?;
+        let stamp = file.metadata().ok().as_ref().and_then(file_stamp);
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).ok()?;
-        let parsed = object::File::parse(&*bytes).ok()?;
-        let index = Arc::new(build_symbol_index(&parsed, labels, recorded_code_id)?);
-        if let Some(stamp) = stamp.filter(|&stamp| Some(stamp) == file_stamp(&file)) {
+        let index = match object::File::parse(&*bytes) {
+            Ok(parsed) => Some(Arc::new(build_symbol_index(
+                &parsed,
+                labels,
+                recorded_code_id,
+            )?)),
+            Err(_) => None,
+        };
+        if let Some(stamp) =
+            stamp.filter(|&stamp| Some(stamp) == file.metadata().ok().as_ref().and_then(file_stamp))
+        {
             if let Ok(mut cache) = self.0.lock() {
-                *cache = Some(CachedSymbolIndex {
-                    stamp,
-                    labels: labels.clone(),
-                    index: Arc::clone(&index),
-                });
+                if &cache.labels != labels {
+                    cache.labels.clone_from(labels);
+                    cache.indexes.clear();
+                }
+                const MAX_INDEXES: usize = 32;
+                if cache.indexes.len() == MAX_INDEXES {
+                    cache.indexes.pop_front();
+                }
+                cache.indexes.push_back((stamp, index.clone()));
             }
         }
-        Some(index)
+        index
     }
 }
 
@@ -333,15 +369,31 @@ fn build_lib_index<'a>(
     lib: &'a Lib,
     match_to_display: &HashMap<&'static str, &'static str>,
 ) -> Option<(&'a str, Arc<LibSymbolIndex>)> {
-    static CACHE: SymbolCache = SymbolCache(Mutex::new(None));
+    static CACHE: std::sync::LazyLock<SymbolCache> = std::sync::LazyLock::new(SymbolCache::default);
 
     let debug_path = lib.debug_path.as_deref().filter(|p| !p.is_empty());
     let binary_path = lib.path.as_deref().filter(|&path| Some(path) != debug_path);
     debug_path.into_iter().chain(binary_path).find_map(|path| {
-        let file = File::open(path).ok()?;
-        let index = CACHE.index(file, match_to_display, lib.code_id.as_deref())?;
+        let index = CACHE.index(Path::new(path), match_to_display, lib.code_id.as_deref())?;
         Some((path, index))
     })
+}
+
+struct ReportLibrary {
+    index: Arc<LibSymbolIndex>,
+    #[cfg(feature = "hotpath-cpu-inline")]
+    inline: Option<InlineSymbols>,
+}
+
+impl ReportLibrary {
+    fn load(lib: &Lib, labels: &HashMap<&'static str, &'static str>) -> Option<Self> {
+        let (_path, index) = build_lib_index(lib, labels)?;
+        Some(Self {
+            #[cfg(feature = "hotpath-cpu-inline")]
+            inline: InlineSymbols::new(_path, index.image_base),
+            index,
+        })
+    }
 }
 
 fn build_symbol_index(
@@ -414,27 +466,29 @@ fn build_symbol_index(
 }
 
 #[cfg(feature = "hotpath-cpu-inline")]
-struct InlineSymbols<'a> {
+struct InlineSymbols {
     loader: addr2line::Loader,
     base: u64,
-    labels: &'a HashMap<&'static str, &'static str>,
     by_address: HashMap<u64, Box<[&'static str]>>,
     demangled: String,
 }
 
 #[cfg(feature = "hotpath-cpu-inline")]
-impl<'a> InlineSymbols<'a> {
-    fn new(path: &str, base: u64, labels: &'a HashMap<&'static str, &'static str>) -> Option<Self> {
+impl InlineSymbols {
+    fn new(path: &str, base: u64) -> Option<Self> {
         Some(Self {
             loader: addr2line::Loader::new(path).ok()?,
             base,
-            labels,
             by_address: HashMap::new(),
             demangled: String::new(),
         })
     }
 
-    fn lookup(&mut self, address: u64) -> &[&'static str] {
+    fn lookup(
+        &mut self,
+        address: u64,
+        labels: &HashMap<&'static str, &'static str>,
+    ) -> &[&'static str] {
         self.by_address.entry(address).or_insert_with(|| {
             let mut found = Vec::new();
             if let Some(mut frames) = self
@@ -454,7 +508,7 @@ impl<'a> InlineSymbols<'a> {
                     write!(self.demangled, "{:#}", rustc_demangle::demangle(&raw)).unwrap();
                     let normalized =
                         strip_inherent_impl_brackets(strip_hash_suffix(&self.demangled));
-                    if let Some(label) = match_eligible_symbol(&normalized, self.labels) {
+                    if let Some(label) = match_eligible_symbol(&normalized, labels) {
                         found.push(label);
                     }
                 }
@@ -618,21 +672,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reuses_symbol_index_only_for_the_same_file_and_labels() {
-        use std::{fs::File, sync::Arc};
+        use std::{path::Path, sync::Arc};
 
         use crate::lib_on::functions::cpu::samply::SymbolCache;
 
         let cache = SymbolCache::default();
         let exe = std::env::current_exe().unwrap();
-        let open = || File::open(&exe).unwrap();
-        let first = cache.index(open(), &identity_map(["first"]), None).unwrap();
-        let reused = cache.index(open(), &identity_map(["first"]), None).unwrap();
-        let changed = cache.index(open(), &identity_map(["other"]), None).unwrap();
+        let first = cache.index(&exe, &identity_map(["first"]), None).unwrap();
+        let reused = cache.index(&exe, &identity_map(["first"]), None).unwrap();
+        let changed = cache.index(&exe, &identity_map(["other"]), None).unwrap();
         assert!(Arc::ptr_eq(&first, &reused));
         assert!(!Arc::ptr_eq(&first, &changed));
         assert!(cache
             .index(
-                File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+                Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")),
                 &identity_map(["other"]),
                 None,
             )
