@@ -630,6 +630,7 @@ pub(crate) struct RawFunctionTiming {
     pub(crate) sampled_count: u64,
     pub(crate) total_duration_ns: u64,
     pub(crate) native_buckets: Vec<(i32, u64)>,
+    pub(crate) zero_count: u64,
     pub(crate) bucket_counts: Vec<u64>,
     pub(crate) routes: Vec<RawRouteFunction>,
 }
@@ -769,6 +770,17 @@ pub(crate) fn get_function_logs_alloc(function_id: u32) -> Option<Option<Functio
     })
 }
 
+/// Scale the sampled sum before rounding to whole nanoseconds.
+pub(crate) fn estimated_duration_total(sampled_ns: u64, samples: u64, calls: u64) -> u64 {
+    if samples == calls {
+        return sampled_ns;
+    }
+    let total = (u128::from(sampled_ns) * u128::from(calls))
+        .checked_div(u128::from(samples))
+        .unwrap_or(0);
+    u64::try_from(total).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -838,5 +850,14 @@ mod tests {
         for (type_name, is_async, expected) in cases {
             assert_eq!(function_name(type_name, is_async), expected, "{type_name}");
         }
+    }
+
+    #[test]
+    fn scales_sampled_time_before_rounding() {
+        use crate::functions::estimated_duration_total;
+
+        assert_eq!(estimated_duration_total(3, 2, 100), 150);
+        assert_eq!(estimated_duration_total(0, 0, 100), 0);
+        assert_eq!(estimated_duration_total(u64::MAX, 1, 2), u64::MAX);
     }
 }

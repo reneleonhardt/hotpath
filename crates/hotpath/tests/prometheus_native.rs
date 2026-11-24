@@ -60,6 +60,8 @@ pub mod tests {
         bucket: Vec<Bucket>,
         #[prost(sint32, optional, tag = "5")]
         schema: Option<i32>,
+        #[prost(uint64, optional, tag = "7")]
+        zero_count: Option<u64>,
         #[prost(message, repeated, tag = "12")]
         positive_span: Vec<BucketSpan>,
         #[prost(sint64, repeated, packed = "false", tag = "13")]
@@ -192,7 +194,7 @@ pub mod tests {
             let span_len: u32 = hist.positive_span.iter().map(|s| s.length.unwrap()).sum();
             assert_eq!(span_len as usize, hist.positive_delta.len(), "{function}");
             let mut cumulative = 0i64;
-            let mut total = 0u64;
+            let mut total = hist.zero_count.unwrap_or_default();
             for delta in &hist.positive_delta {
                 cumulative += delta;
                 assert!(cumulative >= 0, "{function}: negative bucket count");

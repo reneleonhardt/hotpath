@@ -354,7 +354,7 @@ fn collect_families() -> Option<Vec<Family>> {
                         sum: seconds(f.total_duration_ns),
                         classic_buckets: classic_pairs(&FAST_LADDER_NS, f.bucket_counts),
                         native_buckets: f.native_buckets,
-                        zero_count: 0,
+                        zero_count: f.zero_count,
                     }),
                 })
                 .collect(),

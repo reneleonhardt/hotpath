@@ -218,7 +218,7 @@ impl FunctionStats {
         self.duration_sampled_count += 1;
         self.total_duration_ns += duration_ns;
         if let Some(ref mut duration_hist) = self.duration_hist {
-            let clamped_duration = duration_ns.clamp(Self::LOW_DURATION_NS, Self::HIGH_DURATION_NS);
+            let clamped_duration = duration_ns.min(Self::HIGH_DURATION_NS);
             duration_hist.record(clamped_duration).unwrap();
         }
     }
@@ -310,6 +310,13 @@ impl FunctionStats {
         }
         let p = p.clamp(0.0, 100.0);
         self.duration_hist.as_ref().unwrap().value_at_percentile(p)
+    }
+
+    #[cfg(feature = "hotpath-prometheus")]
+    pub(crate) fn duration_zero_count(&self) -> u64 {
+        self.duration_hist
+            .as_ref()
+            .map_or(0, |hist| hist.count_at(0))
     }
 
     /// Sparse native-histogram buckets of sampled durations, `(index, count)`
@@ -407,11 +414,11 @@ impl FunctionStats {
     /// Exact when every call was timed, extrapolated (`avg * count`) under time sampling.
     #[inline]
     pub(crate) fn display_total_duration_ns(&self) -> u64 {
-        if self.duration_sampled_count == self.count {
-            self.total_duration_ns
-        } else {
-            self.avg_duration_ns() * self.count
-        }
+        crate::functions::estimated_duration_total(
+            self.total_duration_ns,
+            self.duration_sampled_count,
+            self.count,
+        )
     }
 }
 
@@ -541,6 +548,9 @@ mod tests {
         stats.update_alloc(Some(0), Some(0), Some(500), Duration::ZERO, None, None);
 
         assert_eq!(stats.duration_sampled_count, 3);
+        assert_eq!(stats.duration_percentile(50.0), 0);
+        #[cfg(feature = "hotpath-prometheus")]
+        assert_eq!(stats.duration_zero_count(), 2);
         assert_eq!(stats.duration_hist.as_ref().unwrap().len(), 3);
     }
 

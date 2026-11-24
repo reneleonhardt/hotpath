@@ -92,7 +92,7 @@ impl FunctionStats {
     #[inline]
     fn record_time(&mut self, ns: u64) {
         if let Some(ref mut hist) = self.hist {
-            let clamped = ns.clamp(Self::LOW_NS, Self::HIGH_NS);
+            let clamped = ns.min(Self::HIGH_NS);
             hist.record(clamped).unwrap();
         }
     }
@@ -128,11 +128,11 @@ impl FunctionStats {
 
     /// Exact when every call was timed, extrapolated (`avg * count`) under time sampling.
     pub fn display_total_ns(&self) -> u64 {
-        if self.sampled_count == self.count {
-            self.total_duration_ns
-        } else {
-            self.avg_duration_ns() * self.count
-        }
+        crate::functions::estimated_duration_total(
+            self.total_duration_ns,
+            self.sampled_count,
+            self.count,
+        )
     }
 
     #[inline]
@@ -143,6 +143,11 @@ impl FunctionStats {
         let p = p.clamp(0.0, 100.0);
         let v = self.hist.as_ref().unwrap().value_at_percentile(p);
         Duration::from_nanos(v)
+    }
+
+    #[cfg(feature = "hotpath-prometheus")]
+    pub(crate) fn duration_zero_count(&self) -> u64 {
+        self.hist.as_ref().map_or(0, |hist| hist.count_at(0))
     }
 
     /// Sparse native-histogram buckets of sampled durations, `(index, count)`
@@ -250,4 +255,23 @@ pub(crate) fn send_duration_measurement_with_log(
         #[cfg(feature = "hotpath-prometheus")]
         route: crate::lib_on::caller_stack::current_route(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::lib_on::functions::timing::state::FunctionStats;
+
+    #[test]
+    fn zero_duration_samples_land_in_histogram() {
+        let mut stats = FunctionStats::new(1, "f", false);
+        for duration in [0, 0, 500] {
+            stats.update(Some(duration), Duration::ZERO, None, None);
+        }
+        assert_eq!(stats.sampled_count, 3);
+        assert_eq!(stats.percentile(50.0), Duration::ZERO);
+        #[cfg(feature = "hotpath-prometheus")]
+        assert_eq!(stats.duration_zero_count(), 2);
+    }
 }

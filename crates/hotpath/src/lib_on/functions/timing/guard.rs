@@ -61,13 +61,13 @@ impl MeasurementGuard {
         let sink = SinkScope::enter(name, ScopeKind::of_guard(caller_scoped), skipped);
         Self {
             name,
-            start: sampled_start(wrapper, skipped),
             wrapper,
             tid: if skipped {
                 0
             } else {
                 crate::tid::current_tid()
             },
+            start: sampled_start(wrapper, skipped),
             skipped,
             caller_scoped,
             #[cfg(feature = "hotpath-sink")]
@@ -147,13 +147,13 @@ impl MeasurementGuardWithLog {
         let sink = SinkScope::enter(name, ScopeKind::of_guard(caller_scoped), skipped);
         Self {
             name,
-            start: sampled_start(wrapper, skipped),
             wrapper,
             tid: if skipped {
                 0
             } else {
                 crate::tid::current_tid()
             },
+            start: sampled_start(wrapper, skipped),
             finished: false,
             skipped,
             caller_scoped,
