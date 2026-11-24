@@ -93,17 +93,19 @@ cargo run --features='hotpath-alloc,hotpath-cpu' --profile profiling
 it will output a CPU usage report (in addition to wall-clock time and allocations):
 
 ```
-+------------------------+-----------+---------+
-| Function               | Samples   | % Total |
-+------------------------+-----------+---------+
-| cpu_basic::sync_work   | 1,915,914 | 56.13%  |
-+------------------------+-----------+---------+
-| cpu_basic::async_sleep | 14,056    | 0.41%   |
-+------------------------+-----------+---------+
-| cpu_basic::sync_alloc  | 1,581     | 0.05%   |
-+------------------------+-----------+---------+
++------------------------+---------------+---------+
+| Function               | CPU time (µs) | % Total |
++------------------------+---------------+---------+
+| cpu_basic::sync_work   | 1,915,914     | 56.13%  |
++------------------------+---------------+---------+
+| cpu_basic::async_sleep | 14,056        | 0.41%   |
++------------------------+---------------+---------+
+| cpu_basic::sync_alloc  | 1,581         | 0.05%   |
++------------------------+---------------+---------+
 samply load /tmp/hotpath/61089-1778083683167502000/hp.json.gz
 ```
+
+If the profile has no usable CPU-time deltas, the report uses sample counts. In JSON, `sample_unit` applies to `samples`, `total_samples`, and `attributed_samples`.
 
 You can optionally run the displayed `samply load` command to open an interactive performance report:
 

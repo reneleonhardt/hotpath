@@ -194,12 +194,36 @@ pub struct JsonFunctionCpuEntry {
     pub labeled: bool,
 }
 
+/// Unit of the CPU report's `samples`, `total_samples`, and `attributed_samples` fields.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuSampleUnit {
+    #[default]
+    Unknown,
+    Samples,
+    Microseconds,
+    Nanoseconds,
+}
+
+impl CpuSampleUnit {
+    pub fn column_label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Weight",
+            Self::Samples => "Samples",
+            Self::Microseconds => "CPU time (µs)",
+            Self::Nanoseconds => "CPU time (ns)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonFunctionsCpuList {
     pub time_elapsed: String,
     pub total_elapsed_ns: u64,
     pub total_samples: u64,
     pub attributed_samples: u64,
+    #[serde(default)]
+    pub sample_unit: CpuSampleUnit,
     pub description: String,
     pub caller_name: String,
     pub data: Vec<JsonFunctionCpuEntry>,

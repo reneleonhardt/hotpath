@@ -150,7 +150,7 @@ fn render_cpu_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .and_then(|e| e.report.as_ref())
         .expect("checked above");
 
-    let header_cells = ["Function", "Samples", "% Total"]
+    let header_cells = ["Function", report.sample_unit.column_label(), "% Total"]
         .iter()
         .map(|h| Cell::from(*h).style(common_styles::HEADER_STYLE_CYAN))
         .collect::<Vec<_>>();

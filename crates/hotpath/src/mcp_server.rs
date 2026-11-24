@@ -218,7 +218,7 @@ Returns a JSON envelope with:
 - status: "idle", "capturing", "ready", or "error"
 - captured_at_ms, capture_duration_ms: timing of the last capture (when available)
 - error: failure message when status is "error"
-- report: when ready, an object with time_elapsed, total_samples, attributed_samples, profile_path, and data: functions sorted by samples, each with id, name, samples, and percent
+- report: when ready, an object with time_elapsed, total_samples, attributed_samples, sample_unit, profile_path, and data: functions sorted by samples, each with id, name, samples, and percent. The sample_unit field applies to all three sample weights.
 - current_session_id, current_session_path: the active sampling session
 
 Use functions_cpu_snapshot to trigger an on-demand capture, then poll this tool until status is "ready". Returns error if hotpath-cpu feature is not enabled."#

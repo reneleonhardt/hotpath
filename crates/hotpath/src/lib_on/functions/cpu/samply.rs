@@ -81,6 +81,7 @@ pub(crate) fn build_cpu_report_from_path(
         );
     }
 
+    let sample_unit = profile.sample_unit();
     let mut sample_counts: HashMap<&'static str, u64> = HashMap::new();
     let mut total_samples: u64 = 0;
     let mut attributed_samples: u64 = 0;
@@ -88,8 +89,7 @@ pub(crate) fn build_cpu_report_from_path(
 
     for thread in &profile.threads {
         let stack = &thread.samples.stack;
-        let thread_cpu_deltas = thread.samples.thread_cpu_delta.as_ref();
-        let weights = thread.samples.weight.as_ref();
+        let weights = thread.samples.weights(sample_unit);
         let prefix = &thread.stack_table.prefix;
         let stack_frame = &thread.stack_table.frame;
         let frame_addr = &thread.frame_table.address;
@@ -98,7 +98,9 @@ pub(crate) fn build_cpu_report_from_path(
         let resource_lib = &thread.resource_table.lib;
 
         for (i, root) in stack.iter().enumerate() {
-            let weight = sample_cpu_weight(thread_cpu_deltas, weights, i);
+            let weight = weights
+                .and_then(|weights| weights.get(i))
+                .map_or(1, |&weight| weight.max(0) as u64);
             total_samples += weight;
 
             let mut matched: HashSet<&'static str> = HashSet::new();
@@ -180,6 +182,7 @@ pub(crate) fn build_cpu_report_from_path(
     Some(CpuReport {
         total_samples,
         attributed_samples,
+        sample_unit,
         caller_name,
         stats,
         profile_path: path.display().to_string(),
@@ -372,21 +375,6 @@ fn match_eligible_symbol(
         })
         .max_by_key(|(candidate, _)| candidate.len())
         .map(|(_, &display)| display)
-}
-
-fn sample_cpu_weight(
-    thread_cpu_deltas: Option<&Vec<i64>>,
-    weights: Option<&Vec<i64>>,
-    index: usize,
-) -> u64 {
-    if let Some(delta) = thread_cpu_deltas.and_then(|deltas| deltas.get(index).copied()) {
-        return delta.max(0) as u64;
-    }
-
-    weights
-        .and_then(|weight_values| weight_values.get(index).copied())
-        .map(|weight| weight.max(0) as u64)
-        .unwrap_or(1)
 }
 
 #[cfg(test)]

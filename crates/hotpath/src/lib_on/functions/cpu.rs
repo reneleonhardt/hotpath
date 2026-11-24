@@ -8,7 +8,8 @@ use crate::dev_logging::warn;
 use crate::table::{Cell, Color, Table};
 
 use crate::json::{
-    CpuSnapshotStatus, JsonFunctionCpuEntry, JsonFunctionsCpuEnvelope, JsonFunctionsCpuList,
+    CpuSampleUnit, CpuSnapshotStatus, JsonFunctionCpuEntry, JsonFunctionsCpuEnvelope,
+    JsonFunctionsCpuList,
 };
 use crate::output::{format_count_display, format_duration, shorten_function_name};
 
@@ -31,6 +32,7 @@ pub(crate) struct CpuFunctionStats {
 pub(crate) struct CpuReport {
     pub(crate) total_samples: u64,
     pub(crate) attributed_samples: u64,
+    pub(crate) sample_unit: CpuSampleUnit,
     pub(crate) caller_name: &'static str,
     pub(crate) stats: Vec<CpuFunctionStats>,
     pub(crate) profile_path: String,
@@ -238,6 +240,7 @@ pub(crate) fn build_cpu_json(
         total_elapsed_ns: current_elapsed_ns,
         total_samples: report.total_samples,
         attributed_samples: report.attributed_samples,
+        sample_unit: report.sample_unit,
         description,
         caller_name: report.caller_name.to_string(),
         data: entries,
@@ -252,7 +255,11 @@ fn print_table<W: Write>(table: &Table, writer: &mut W) {
 }
 
 pub(crate) fn report_functions_cpu_table<W: Write>(writer: &mut W, list: &JsonFunctionsCpuList) {
-    let mut info = format!("{} total samples", list.total_samples);
+    let mut info = format!(
+        "{} total {}",
+        list.total_samples,
+        list.sample_unit.column_label().to_lowercase(),
+    );
     if list.included_count < list.total_count {
         info.push_str(&format!(", {}/{}", list.included_count, list.total_count));
     }
@@ -264,7 +271,7 @@ pub(crate) fn report_functions_cpu_table<W: Write>(writer: &mut W, list: &JsonFu
         let mut table = Table::new();
         table.add_row(vec![
             Cell::header("Function"),
-            Cell::header("Samples"),
+            Cell::header(list.sample_unit.column_label()),
             Cell::header("% Total"),
         ]);
 
