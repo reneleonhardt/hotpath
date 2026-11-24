@@ -1,8 +1,10 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use crate::dev_logging::{info, warn};
 use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
@@ -56,18 +58,14 @@ pub(crate) fn build_cpu_report_from_path(
         warn!("cpu report: could not resolve current_exe; CPU report will be empty");
     }
 
-    let primary: Option<(usize, LibSymbolIndex)> =
+    let primary: Option<(usize, Arc<LibSymbolIndex>)> =
         profile.libs.iter().enumerate().find_map(|(i, lib)| {
-            let lib_path = lib
-                .debug_path
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .or(lib.path.as_deref())
-                .unwrap_or("<missing>");
-            let is_primary = primary_lib_name
-                .as_ref()
-                .and_then(|name| Path::new(lib_path).file_name().map(|n| n == *name))
-                .unwrap_or(false);
+            let is_primary = primary_lib_name.as_deref().is_some_and(|name| {
+                lib.path
+                    .iter()
+                    .chain(&lib.debug_path)
+                    .any(|path| Path::new(path).file_name() == Some(name))
+            });
             if !is_primary {
                 return None;
             }
@@ -86,10 +84,10 @@ pub(crate) fn build_cpu_report_from_path(
     let mut total_samples: u64 = 0;
     let mut attributed_samples: u64 = 0;
     let inclusive = *CPU_INCLUSIVE;
+    let mut matched = HashSet::new();
+    let mut weights_by_root = Vec::new();
 
     for thread in &profile.threads {
-        let stack = &thread.samples.stack;
-        let weights = thread.samples.weights(sample_unit);
         let prefix = &thread.stack_table.prefix;
         let stack_frame = &thread.stack_table.frame;
         let frame_addr = &thread.frame_table.address;
@@ -97,15 +95,9 @@ pub(crate) fn build_cpu_report_from_path(
         let func_resource = &thread.func_table.resource;
         let resource_lib = &thread.resource_table.lib;
 
-        for (i, root) in stack.iter().enumerate() {
-            let weight = weights
-                .and_then(|weights| weights.get(i))
-                .map_or(1, |&weight| weight.max(0) as u64);
-            total_samples += weight;
-
-            let mut matched: HashSet<&'static str> = HashSet::new();
+        let attribute = |root, weight| {
             let mut credited = false;
-            let mut cur = *root;
+            let mut cur = root;
             while let Some(s) = cur {
                 let frame_idx = match stack_frame.get(s) {
                     Some(f) => *f,
@@ -138,18 +130,30 @@ pub(crate) fn build_cpu_report_from_path(
                     }
                 }
 
-                cur = prefix.get(s).copied().flatten();
+                // Samply interns parents before children. Stop on a malformed link.
+                cur = prefix
+                    .get(s)
+                    .copied()
+                    .flatten()
+                    .filter(|&parent| parent < s);
             }
 
             if inclusive && !matched.is_empty() {
-                for sym in &matched {
-                    *sample_counts.entry(*sym).or_insert(0) += weight;
+                for sym in matched.drain() {
+                    *sample_counts.entry(sym).or_insert(0) += weight;
                 }
                 attributed_samples += weight;
             } else if credited {
                 attributed_samples += weight;
             }
-        }
+        };
+        total_samples += visit_sample_stacks(
+            &thread.samples.stack,
+            thread.samples.weights(sample_unit),
+            stack_frame.len(),
+            &mut weights_by_root,
+            attribute,
+        );
     }
 
     let mut stats: Vec<CpuFunctionStats> = sample_counts
@@ -215,19 +219,71 @@ struct LibSymbolIndex {
 #[cfg_attr(feature = "hotpath-meta", hotpath_meta::measure_all)]
 impl LibSymbolIndex {
     fn lookup(&self, addr: u64) -> Option<&'static str> {
-        if self.ranges.is_empty() {
-            return None;
-        }
         let idx = self.ranges.partition_point(|(start, _, _)| *start <= addr);
-        if idx == 0 {
-            return None;
+        let (_, end, sym) = self.ranges[idx.checked_sub(1)?];
+        (addr < end).then_some(sym)
+    }
+}
+
+type FileStamp = (u64, u64, u64, i64, i64);
+
+#[cfg(unix)]
+fn file_stamp(file: &File) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().ok()?;
+    Some((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn file_stamp(_: &File) -> Option<FileStamp> {
+    None
+}
+
+struct CachedSymbolIndex {
+    stamp: FileStamp,
+    labels: HashMap<&'static str, &'static str>,
+    index: Arc<LibSymbolIndex>,
+}
+
+#[derive(Default)]
+struct SymbolCache(Mutex<Option<CachedSymbolIndex>>);
+
+impl SymbolCache {
+    fn index(
+        &self,
+        mut file: File,
+        labels: &HashMap<&'static str, &'static str>,
+    ) -> Option<Arc<LibSymbolIndex>> {
+        let stamp = file_stamp(&file);
+        if let Ok(cache) = self.0.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if Some(cached.stamp) == stamp && &cached.labels == labels {
+                    return Some(Arc::clone(&cached.index));
+                }
+            }
         }
-        let (start, end, sym) = self.ranges[idx - 1];
-        if addr >= start && addr < end {
-            Some(sym)
-        } else {
-            None
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        let parsed = object::File::parse(&*bytes).ok()?;
+        let index = Arc::new(build_symbol_index(&parsed, labels));
+        if let Some(stamp) = stamp.filter(|&stamp| Some(stamp) == file_stamp(&file)) {
+            if let Ok(mut cache) = self.0.lock() {
+                *cache = Some(CachedSymbolIndex {
+                    stamp,
+                    labels: labels.clone(),
+                    index: Arc::clone(&index),
+                });
+            }
         }
+        Some(index)
     }
 }
 
@@ -235,20 +291,26 @@ impl LibSymbolIndex {
 fn build_lib_index(
     lib: &Lib,
     match_to_display: &HashMap<&'static str, &'static str>,
-) -> Option<LibSymbolIndex> {
-    let path = lib
-        .debug_path
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .or(lib.path.as_deref())?;
+) -> Option<Arc<LibSymbolIndex>> {
+    static CACHE: SymbolCache = SymbolCache(Mutex::new(None));
 
-    let bytes = std::fs::read(path).ok()?;
-    let parsed = object::File::parse(&*bytes).ok()?;
+    let debug_path = lib.debug_path.as_deref().filter(|p| !p.is_empty());
+    let binary_path = lib.path.as_deref().filter(|&path| Some(path) != debug_path);
+    debug_path.into_iter().chain(binary_path).find_map(|path| {
+        let file = File::open(path).ok()?;
+        CACHE.index(file, match_to_display)
+    })
+}
 
-    let base = pick_image_base(&parsed);
+fn build_symbol_index(
+    parsed: &object::File<'_>,
+    match_to_display: &HashMap<&'static str, &'static str>,
+) -> LibSymbolIndex {
+    let base = pick_image_base(parsed);
 
     let mut all_starts: Vec<u64> = Vec::new();
     let mut matched_pending: Vec<(u64, u64, &'static str)> = Vec::new();
+    let mut demangled = String::new();
     for sym in parsed.symbols() {
         if !matches!(sym.kind(), SymbolKind::Text) {
             continue;
@@ -260,7 +322,8 @@ fn build_lib_index(
             Ok(n) if !n.is_empty() => n,
             _ => continue,
         };
-        let demangled = format!("{:#}", rustc_demangle::demangle(raw_name));
+        demangled.clear();
+        write!(demangled, "{:#}", rustc_demangle::demangle(raw_name)).unwrap();
         let normalized = strip_hash_suffix(&demangled);
         let normalized = strip_inherent_impl_brackets(normalized);
         if let Some(display) = match_eligible_symbol(&normalized, match_to_display) {
@@ -289,7 +352,7 @@ fn build_lib_index(
 
     ranges.sort_by_key(|(start, _, _)| *start);
 
-    Some(LibSymbolIndex { ranges })
+    LibSymbolIndex { ranges }
 }
 
 fn pick_image_base<'a>(file: &object::File<'a, &'a [u8]>) -> u64 {
@@ -366,29 +429,142 @@ fn match_eligible_symbol(
         return Some(display);
     }
 
-    match_to_display
-        .iter()
-        .filter(|(candidate, _)| {
-            normalized
-                .strip_prefix(**candidate)
-                .is_some_and(|rest| rest.starts_with("::"))
-        })
-        .max_by_key(|(candidate, _)| candidate.len())
-        .map(|(_, &display)| display)
+    // A short registry is cheaper to scan than to hash every path prefix.
+    if match_to_display.len() <= 32 {
+        return match_to_display
+            .iter()
+            .filter(|(candidate, _)| {
+                normalized
+                    .strip_prefix(**candidate)
+                    .is_some_and(|rest| rest.starts_with("::"))
+            })
+            .max_by_key(|(candidate, _)| candidate.len())
+            .map(|(_, &display)| display);
+    }
+
+    let mut prefix = normalized;
+    while let Some(end) = prefix.rfind("::") {
+        if let Some(&display) = match_to_display.get(&prefix[..end]) {
+            return Some(display);
+        }
+        // Retain the first colon so overlapping separators still match.
+        prefix = &prefix[..=end];
+    }
+    None
+}
+
+fn visit_sample_stacks(
+    stacks: &[Option<usize>],
+    weights: Option<&[i64]>,
+    stack_count: usize,
+    weights_by_root: &mut Vec<Option<u64>>,
+    mut attribute: impl FnMut(Option<usize>, u64),
+) -> u64 {
+    let mut total = 0;
+    let roots = stacks.iter().enumerate().map(|(i, &root)| {
+        let weight = weights
+            .and_then(|weights| weights.get(i))
+            .map_or(1, |&weight| weight.max(0) as u64);
+        total += weight;
+        (root, weight)
+    });
+
+    // Walk repeated roots once, but avoid a dense table for sparse profiles.
+    if stack_count > 0 && stack_count <= stacks.len() / 2 {
+        weights_by_root.resize(stack_count, None);
+        for (root, weight) in roots {
+            if let Some(cell) = root.and_then(|root| weights_by_root.get_mut(root)) {
+                *cell.get_or_insert(0) += weight;
+            }
+        }
+        for (root, weight) in weights_by_root.drain(..).enumerate() {
+            if let Some(weight) = weight {
+                attribute(Some(root), weight);
+            }
+        }
+    } else {
+        for (root, weight) in roots {
+            attribute(root, weight);
+        }
+    }
+
+    total
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
+    use crate::lib_on::functions::cpu::json::Lib;
     use crate::lib_on::functions::cpu::samply::{
-        match_eligible_symbol, strip_hash_suffix, strip_inherent_impl_brackets,
+        build_lib_index, match_eligible_symbol, strip_hash_suffix, strip_inherent_impl_brackets,
     };
 
     fn identity_map<const N: usize>(
         items: [&'static str; N],
     ) -> HashMap<&'static str, &'static str> {
         items.into_iter().map(|s| (s, s)).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reuses_symbol_index_only_for_the_same_file_and_labels() {
+        use std::{fs::File, sync::Arc};
+
+        use crate::lib_on::functions::cpu::samply::SymbolCache;
+
+        let cache = SymbolCache::default();
+        let exe = std::env::current_exe().unwrap();
+        let open = || File::open(&exe).unwrap();
+        let first = cache.index(open(), &identity_map(["first"])).unwrap();
+        let reused = cache.index(open(), &identity_map(["first"])).unwrap();
+        let changed = cache.index(open(), &identity_map(["other"])).unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(cache
+            .index(
+                File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+                &identity_map(["other"])
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn falls_back_to_executable_when_debug_file_is_unavailable() {
+        let exe = std::env::current_exe().unwrap();
+        let lib = Lib {
+            path: Some(exe.to_str().unwrap().into()),
+            debug_path: Some(exe.join("missing.debug").to_str().unwrap().into()),
+        };
+        assert!(build_lib_index(&lib, &HashMap::new()).is_some());
+    }
+
+    #[test]
+    fn groups_repeated_roots_without_losing_weights() {
+        use crate::lib_on::functions::cpu::samply::visit_sample_stacks;
+
+        let stacks = [Some(0), Some(0), None, Some(1), Some(9), Some(0)];
+        let sample_weights = [0, 5, 7, 0, 11];
+        let mut scratch = Vec::new();
+        for stack_count in [8, 2, 2] {
+            let mut weights = HashMap::new();
+            let mut visits = 0;
+            let total = visit_sample_stacks(
+                &stacks,
+                Some(&sample_weights),
+                stack_count,
+                &mut scratch,
+                |root, weight| {
+                    if let Some(root) = root.filter(|&root| root < stack_count) {
+                        *weights.entry(root).or_insert(0) += weight;
+                        visits += 1;
+                    }
+                },
+            );
+            assert_eq!(total, 24);
+            assert_eq!(weights, HashMap::from([(0, 6), (1, 0)]));
+            assert_eq!(visits, if stack_count == 2 { 2 } else { 4 });
+        }
     }
 
     #[test]
@@ -459,6 +635,16 @@ mod tests {
         );
 
         assert_eq!(matched, Some("mevlog::misc::rpc_tracing::rpc_tx_calls"));
+        let mut large = eligible;
+        large.extend(
+            "a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff gg"
+                .split_whitespace()
+                .map(|name| (name, name)),
+        );
+        assert_eq!(
+            match_eligible_symbol("mevlog::misc::rpc_tracing::rpc_tx_calls:::suffix", &large),
+            matched
+        );
     }
 
     #[test]
@@ -469,5 +655,14 @@ mod tests {
         let matched = match_eligible_symbol("mevlog::compute_hash::{{closure}}", &map);
 
         assert_eq!(matched, Some("custom_label"));
+        assert_eq!(
+            match_eligible_symbol("mevlog::compute_hash:::suffix", &map),
+            matched
+        );
+        assert_eq!(match_eligible_symbol("mevlog::compute_hash", &map), matched);
+        assert_eq!(
+            match_eligible_symbol("mevlog::compute_hashes::{{closure}}", &map),
+            None
+        );
     }
 }
