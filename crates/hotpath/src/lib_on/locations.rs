@@ -38,6 +38,67 @@ pub fn register_location(name: &'static str, location: &'static Location) {
     }
 }
 
+#[doc(hidden)]
+pub fn register_block_label(label: &'static str, location: &'static Location) {
+    register_location(label, location);
+    crate::functions::register_function_label(label, None);
+}
+
+/// Call sites usually have one or two labels. Keep those lock-free after
+/// registration and use a set for call sites with more labels.
+#[doc(hidden)]
+pub struct BlockLabels {
+    common: [OnceLock<&'static str>; 2],
+    extra: OnceLock<std::sync::RwLock<std::collections::HashSet<&'static str>>>,
+}
+
+impl BlockLabels {
+    pub const fn new() -> Self {
+        Self {
+            common: [const { OnceLock::new() }; 2],
+            extra: OnceLock::new(),
+        }
+    }
+
+    #[inline]
+    pub fn register(&self, label: &'static str, location: &'static Location) {
+        if self.common.iter().any(|slot| {
+            slot.get()
+                .is_some_and(|&cached| std::ptr::eq(label, cached))
+        }) {
+            return;
+        }
+        self.register_uncached(label, location);
+    }
+
+    #[cold]
+    fn register_uncached(&self, label: &'static str, location: &'static Location) {
+        for slot in &self.common {
+            let cached = *slot.get_or_init(|| {
+                register_block_label(label, location);
+                label
+            });
+            if std::ptr::eq(label, cached) || label == cached {
+                return;
+            }
+        }
+        self.register_extra(label, location);
+    }
+
+    #[cold]
+    fn register_extra(&self, label: &'static str, location: &'static Location) {
+        let labels = self.extra.get_or_init(Default::default);
+        if labels.read().unwrap().contains(label) {
+            return;
+        }
+        let _suspend = crate::lib_on::SuspendAllocTracking::new();
+        let mut labels = labels.write().unwrap();
+        if labels.insert(label) {
+            register_block_label(label, location);
+        }
+    }
+}
+
 /// Registers a location captured at runtime by the deprecated
 /// `wrap::*::new()` constructors (`#[track_caller]`). The `Location` is
 /// heap-allocated and leaked, but only for a key not registered yet, so
@@ -161,6 +222,31 @@ fn is_absolute_path(file: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn block_labels_register_shared_prefixes_and_overflow_once() {
+        static LOC: crate::Location = crate::Location {
+            file: file!(),
+            line: line!(),
+            column: column!(),
+        };
+        let cache = crate::BlockLabels::new();
+        let long = "block-label-test-long";
+        let short = &long[..10];
+        assert_eq!(long.as_ptr(), short.as_ptr());
+        for label in [
+            long,
+            short,
+            "block-label-test-extra",
+            short,
+            "block-label-test-extra",
+        ] {
+            cache.register(label, &LOC);
+            assert!(crate::lib_on::locations::lookup_location(label).is_some());
+            assert!(crate::functions::is_labeled(label));
+        }
+        assert_eq!(cache.extra.get().unwrap().read().unwrap().len(), 1);
+    }
+
     use crate::lib_on::locations::{
         lookup_location, normalize_file_path, register_location, Location,
     };

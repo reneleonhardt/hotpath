@@ -83,7 +83,7 @@ pub(crate) mod sampling;
 pub(crate) mod valgrind;
 
 #[doc(hidden)]
-pub use locations::{register_location, Location};
+pub use locations::{register_block_label, register_location, BlockLabels, Location};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "hotpath-meta")] {
@@ -232,42 +232,44 @@ impl Drop for SuspendAllocTracking {
 /// * [`main`](hotpath_macros::main) - Attribute macro that initializes profiling
 #[macro_export]
 macro_rules! measure_block {
-    // A literal label shares the functions namespace with `#[measure(label)]`,
-    // so both are checked for uniqueness under the `function` kind. The block
-    // wrapping turns the literal into a plain expression for the arm below.
     ($label:literal, $expr:expr) => {{
-        $crate::__unique_label!(function, $label);
-        $crate::measure_block!({ $label }, $expr)
+        let __hotpath_label = $crate::__hotpath_block_label!($label);
+        let _guard = $crate::functions::build_measurement_guard_block(__hotpath_label, false);
+        $expr
     }};
 
     ($label:expr, $expr:expr) => {{
-        let __hotpath_label: &'static str = $label;
-        {
-            static __HOTPATH_LOC: $crate::Location = $crate::Location {
-                file: file!(),
-                line: line!(),
-                column: column!(),
-            };
-            // The label is a runtime expression, so one call site can produce
-            // several distinct labels; re-register whenever the value changes
-            // (tracked by pointer) instead of only once, so every label
-            // resolves to this location while the common fixed-label case
-            // stays one relaxed load per execution.
-            static __HOTPATH_LAST_LABEL: std::sync::atomic::AtomicPtr<u8> =
-                std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-            let __hotpath_label_ptr = __hotpath_label.as_ptr() as *mut u8;
-            if __HOTPATH_LAST_LABEL.load(std::sync::atomic::Ordering::Relaxed)
-                != __hotpath_label_ptr
-            {
-                $crate::register_location(__hotpath_label, &__HOTPATH_LOC);
-                $crate::functions::register_function_label(__hotpath_label, None);
-                __HOTPATH_LAST_LABEL
-                    .store(__hotpath_label_ptr, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+        let __hotpath_label = $crate::__hotpath_block_label!($label);
         let _guard = $crate::functions::build_measurement_guard_block(__hotpath_label, false);
-
         $expr
+    }};
+}
+
+/// Registers a block label while preserving distinct call sites for literal labels.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __hotpath_block_label {
+    ($label:literal) => {{
+        $crate::__unique_label!(function, $label);
+        static LOC: $crate::Location = $crate::Location {
+            file: file!(),
+            line: line!(),
+            column: column!(),
+        };
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        REGISTERED.call_once(|| $crate::register_block_label($label, &LOC));
+        $label
+    }};
+    ($label:expr) => {{
+        static LOC: $crate::Location = $crate::Location {
+            file: file!(),
+            line: line!(),
+            column: column!(),
+        };
+        static LABELS: $crate::BlockLabels = $crate::BlockLabels::new();
+        let label: &'static str = $label;
+        LABELS.register(label, &LOC);
+        label
     }};
 }
 
