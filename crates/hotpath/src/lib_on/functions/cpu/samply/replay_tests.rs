@@ -1,12 +1,21 @@
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fmt::Write as _;
+use std::fs;
+use std::process::Command;
+use std::sync::LazyLock;
+
+use object::{Object, ObjectSymbol};
+
+use crate::functions::cpu::samply::pick_image_base;
+use crate::functions::cpu::{build_cpu_report_from_path, CPU_INCLUSIVE};
+use crate::json::CpuSampleUnit;
+
+static RUSTC: LazyLock<OsString> =
+    LazyLock::new(|| std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
+
 #[test]
 fn replays_shared_library_attribution() {
-    use std::{collections::HashMap, fmt::Write as _, fs, process::Command};
-
-    use object::{Object, ObjectSymbol};
-
-    use crate::functions::cpu::samply::pick_image_base;
-    use crate::json::CpuSampleUnit;
-
     const ENTRY: &str = "hotpath_cpu_fixture::entry";
     const LEAF: &str = "hotpath_cpu_fixture::leaf";
     let dir = std::env::temp_dir().join(format!("hotpath-cpu-replay-{}", std::process::id()));
@@ -17,16 +26,25 @@ fn replays_shared_library_attribution() {
         &source,
         r#"
 #[inline(always)]
-fn leaf(value: u64) -> u64 { std::hint::black_box(value).wrapping_mul(17) }
+fn leaf(value: u64) -> u64 {
+    std::hint::black_box(value).wrapping_mul(17)
+}
+
 #[inline(never)]
-fn entry(value: u64) -> u64 { leaf(value) }
+fn entry(value: u64) -> u64 {
+    leaf(value)
+}
+
 #[no_mangle]
-pub extern "C" fn replay_call(value: u64) -> u64 { entry(value) }
+pub extern "C" fn replay_call(value: u64) -> u64 {
+    entry(value)
+}
 "#,
     )
     .unwrap();
-    let mut rustc = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
+    let mut rustc = Command::new(&*RUSTC);
     rustc.args([
+        "--edition=2021",
         "--crate-name",
         "hotpath_cpu_fixture",
         "--crate-type=cdylib",
@@ -91,38 +109,43 @@ pub extern "C" fn replay_call(value: u64) -> u64 { entry(value) }
         hex
     });
 
+    let pid = std::process::id();
     let thread = serde_json::json!({
-        "pid": format!("{}.1", std::process::id()),
+        "pid": format!("{pid}.1"),
         "samples": {"stack": [0, 0, 0, 0], "threadCPUDelta": [2, 0, 5, 4]},
         "stackTable": {"prefix": [null], "frame": [0]},
         "frameTable": {"address": [pc - pick_image_base(&object)], "func": [0]},
         "funcTable": {"resource": [0]},
         "resourceTable": {"lib": [0]}
     });
-    let mut other = thread.clone();
-    other["pid"] = serde_json::json!(std::process::id());
-    other["samples"]["threadCPUDelta"] = serde_json::Value::Null;
+    let mut earlier = thread.clone();
+    earlier["pid"] = serde_json::json!(pid);
+    earlier["samples"]["threadCPUDelta"] = serde_json::Value::Null;
+    let mut foreign = thread.clone();
+    foreign["pid"] = serde_json::json!(pid + 1);
     let path = dir.join("profile.json");
     let profile = serde_json::json!({
         "meta": {"sampleUnits": {"threadCPUDelta": "µs"}},
         "libs": [{"path": library, "codeId": code_id}],
-        "threads": [other, thread],
+        "threads": [earlier, foreign, thread],
     });
     fs::write(&path, profile.to_string()).unwrap();
+    let expected_rows = if cfg!(feature = "hotpath-cpu-inline") && *CPU_INCLUSIVE {
+        &[(ENTRY, 11), (LEAF, 11)][..]
+    } else {
+        &[(expected, 11)][..]
+    };
     for _ in 0..2 {
         let names = HashMap::from([(ENTRY, 1), (LEAF, 2)]);
-        let report =
-            crate::functions::cpu::build_cpu_report_from_path("replay", &path, Some(names))
-                .unwrap();
+        let report = build_cpu_report_from_path("replay", &path, Some(names)).unwrap();
         assert_eq!(report.sample_unit, CpuSampleUnit::Microseconds);
         assert_eq!((report.total_samples, report.attributed_samples), (11, 11));
-        assert!(report
+        let rows: Vec<_> = report
             .stats
             .iter()
-            .any(|row| row.name == expected && row.samples == 11));
-        if !*crate::functions::cpu::CPU_INCLUSIVE {
-            assert_eq!(report.stats.len(), 1);
-        }
+            .map(|row| (row.name, row.samples))
+            .collect();
+        assert_eq!(rows, expected_rows);
     }
     fs::remove_dir_all(dir).unwrap();
 }

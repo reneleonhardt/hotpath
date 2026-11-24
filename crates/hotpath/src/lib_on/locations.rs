@@ -3,8 +3,8 @@
 //! (function name, resource id string, debug loc); report builders join on
 //! that string at build time, so the hot path never carries location data.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{OnceLock, RwLock};
 
 use crate::json::JsonLocation;
 
@@ -50,7 +50,7 @@ pub fn register_block_label(label: &'static str, location: &'static Location) {
 #[doc(hidden)]
 pub struct BlockLabels {
     common: [OnceLock<&'static str>; 2],
-    extra: OnceLock<std::sync::RwLock<std::collections::HashSet<&'static str>>>,
+    extra: OnceLock<RwLock<HashSet<&'static str>>>,
 }
 
 #[cfg(test)]

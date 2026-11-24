@@ -126,12 +126,13 @@ pub mod tests {
 
     #[test]
     fn final_totals_include_workers_and_cleanup() {
-        let report = Example::new("test-alloc", "run_totals")
-            .features("hotpath-alloc")
-            .env("HOTPATH_REPORT", "functions-alloc,functions-timing,threads")
-            .env("HOTPATH_ALLOC_CUMULATIVE", "1")
-            .env("HOTPATH_ALLOC_METRIC", "bytes")
-            .env("HOTPATH_FUNCTIONS_TIME_SAMPLING_RATE", "1")
+        let report = example_of("test-alloc", "run_totals")
+            .envs(&[
+                ("HOTPATH_REPORT", "functions-alloc,functions-timing,threads"),
+                ("HOTPATH_ALLOC_CUMULATIVE", "1"),
+                ("HOTPATH_ALLOC_METRIC", "bytes"),
+                ("HOTPATH_FUNCTIONS_TIME_SAMPLING_RATE", "1"),
+            ])
             .json()
             .report();
         let alloc = report.functions_alloc.unwrap();

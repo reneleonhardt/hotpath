@@ -125,6 +125,8 @@ Enable `hotpath-cpu-inline` to preserve compiler inlining and attribute inline f
 
 With `hotpath-cpu` alone, you can disable the rewrite by setting `HOTPATH_KEEP_INLINE=1`. The variable is read at proc-macro expansion time, so touch the source file or run `cargo clean` after toggling it.
 
+## Shared-library attribution
+
 Hotpath can attribute registered functions in sampled shared libraries from the profiled process when their qualified symbols are available. A library must register its measurements with the same Hotpath instance as the executable.
 
 ## Symbol attribution for impl functions
