@@ -43,12 +43,14 @@ where
     A: GlobalAlloc,
 {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        #[cfg(feature = "hotpath-alloc")]
-        crate::lib_on::functions::alloc::core::track_alloc(layout.size());
+        // SAFETY: the caller upholds GlobalAlloc's contract for `layout`.
+        let ptr = unsafe { self.0.alloc(layout) };
 
-        // SAFETY: caller upholds GlobalAlloc's contract for `layout`; it is
-        // forwarded unchanged.
-        unsafe { self.0.alloc(layout) }
+        #[cfg(feature = "hotpath-alloc")]
+        if !ptr.is_null() {
+            crate::lib_on::functions::alloc::core::track_alloc(layout.size());
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -64,12 +66,14 @@ where
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        #[cfg(feature = "hotpath-alloc")]
-        crate::lib_on::functions::alloc::core::track_alloc(layout.size());
+        // SAFETY: the caller upholds GlobalAlloc's contract for `layout`.
+        let ptr = unsafe { self.0.alloc_zeroed(layout) };
 
-        // SAFETY: caller upholds GlobalAlloc's contract for `layout`; it is
-        // forwarded unchanged.
-        unsafe { self.0.alloc_zeroed(layout) }
+        #[cfg(feature = "hotpath-alloc")]
+        if !ptr.is_null() {
+            crate::lib_on::functions::alloc::core::track_alloc(layout.size());
+        }
+        ptr
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -86,5 +90,53 @@ where
             crate::lib_on::functions::alloc::core::track_alloc(new_size);
         }
         new_ptr
+    }
+}
+
+#[cfg(all(test, feature = "hotpath-alloc"))]
+mod tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    use crate::lib_on::functions::alloc::guard::{pop_alloc_stack, push_alloc_stack};
+    use crate::CountingAllocator;
+
+    struct Limited;
+
+    unsafe impl GlobalAlloc for Limited {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if layout.size() == 8 {
+                unsafe { System.alloc(layout) }
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[test]
+    fn counts_only_successful_allocations() {
+        let alloc = CountingAllocator::with(Limited);
+        push_alloc_stack();
+        unsafe {
+            for (size, zeroed) in [(8, false), (8, true), (32, false), (64, true)] {
+                let layout = Layout::from_size_align(size, 1).unwrap();
+                let ptr = if zeroed {
+                    alloc.alloc_zeroed(layout)
+                } else {
+                    alloc.alloc(layout)
+                };
+                assert_eq!(ptr.is_null(), size != 8);
+                if !ptr.is_null() {
+                    assert!(alloc.realloc(ptr, layout, 32).is_null());
+                    let ptr = alloc.realloc(ptr, layout, 8);
+                    assert!(!ptr.is_null());
+                    alloc.dealloc(ptr, layout);
+                }
+            }
+        }
+        assert_eq!(pop_alloc_stack(), (32, 4));
     }
 }
