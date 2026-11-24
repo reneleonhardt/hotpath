@@ -278,7 +278,7 @@ fn matches_code_id(actual: Option<&[u8]>, recorded: Option<&str>) -> bool {
     recorded.len() == actual.len() * 2
         && actual
             .iter()
-            .zip(recorded.as_bytes().chunks_exact(2))
+            .zip(recorded.as_bytes().as_chunks::<2>().0)
             .all(|(&byte, pair)| {
                 pair[0].to_ascii_lowercase() == HEX[(byte >> 4) as usize]
                     && pair[1].to_ascii_lowercase() == HEX[(byte & 0xf) as usize]

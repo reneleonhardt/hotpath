@@ -269,10 +269,10 @@ pin_project_lite::pin_project! {
 }
 
 #[doc(hidden)]
-pub fn measure_block_await<'a, F: std::future::IntoFuture, const N: usize>(
+pub fn measure_block_await<F: std::future::IntoFuture, const N: usize>(
     future: F,
-    scopes: [&'a mut MeasurementGuardSync; N],
-) -> MeasuredAwait<F::IntoFuture, [&'a mut MeasurementGuardSync; N]> {
+    scopes: [&mut MeasurementGuardSync; N],
+) -> MeasuredAwait<F::IntoFuture, [&mut MeasurementGuardSync; N]> {
     MeasuredAwait {
         inner: future.into_future(),
         scopes,

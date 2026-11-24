@@ -46,6 +46,7 @@ pub fn register_block_label(label: &'static str, location: &'static Location) {
 
 /// Call sites usually have one or two labels. Keep those lock-free after
 /// registration and use a set for call sites with more labels.
+#[derive(Default)]
 #[doc(hidden)]
 pub struct BlockLabels {
     common: [OnceLock<&'static str>; 2],

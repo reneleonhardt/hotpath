@@ -1,0 +1,71 @@
+name: Hotpath allocation accuracy probe
+
+on:
+  push:
+    branches: [fix/allocation-accuracy-CI]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  stable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked -p hotpath --all-features -- -D warnings
+      - name: Build against the existing meta copies
+        run: |
+          cargo check --locked --features hotpath,hotpath-alloc-meta
+          cargo check --locked -p test-all-features --example benchmark_meta \
+            --features hotpath-alloc,hotpath-alloc-meta,hotpath-cloud-meta,hotpath-callgrind-meta,hotpath-prometheus
+      - name: Run branch regressions
+        run: |
+          cargo test --locked -p hotpath --lib --features hotpath-alloc,hotpath-cpu-inline,hotpath-prometheus,hotpath-ordered-drain
+          cargo test --locked -p hotpath --features hotpath --test functions_alloc final_totals_include_workers_and_cleanup -- --test-threads=1
+          cargo test --locked -p hotpath --features hotpath-prometheus --test prometheus_native -- --test-threads=1
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+      - name: Check meta interoperability and run profiling unit tests
+        run: |
+          cargo check --locked --features hotpath,hotpath-alloc-meta
+          cargo test --locked -p hotpath --lib --features hotpath-alloc,hotpath-cpu-inline,hotpath-prometheus,hotpath-ordered-drain
+
+  cpu-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Enable perf access
+        run: |
+          echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+          echo 0 | sudo tee /proc/sys/kernel/kptr_restrict
+      - name: Download the upstream Samply binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ~/.cargo/bin
+          gh release download samply-release -p samply -D ~/.cargo/bin --clobber --repo hotpath-rs/hotpath
+          chmod +x ~/.cargo/bin/samply
+      - name: Run upstream CPU integration tests
+        env:
+          HOTPATH_SAMPLY_WRAPPER_BIN: ${{ github.workspace }}/target/debug/hotpath-samply
+        run: |
+          cargo build --locked -p hotpath --bin hotpath-samply --features hotpath-cpu
+          setsid -w cargo test --locked --features hotpath-cpu --test functions_cpu -- --test-threads=1
