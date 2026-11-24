@@ -160,6 +160,10 @@ pub struct MeasurementGuardSync {
     name: &'static str,
     wrapper: bool,
     tid: u64,
+    paused: bool,
+    migrated: bool,
+    bytes: u64,
+    count: u64,
     start: Option<Instant>,
     skipped: bool,
     caller_scoped: bool,
@@ -198,6 +202,10 @@ impl MeasurementGuardSync {
             name,
             wrapper,
             tid: crate::tid::current_tid(),
+            paused: false,
+            migrated: false,
+            bytes: 0,
+            count: 0,
             start: sampled_start(wrapper, skipped),
             skipped,
             caller_scoped,
@@ -229,11 +237,13 @@ impl Drop for MeasurementGuardSync {
         if self.caller_scoped && !cross_thread {
             crate::lib_on::caller_stack::pop_caller();
         }
-        let (bytes_total, count_total) = if cross_thread {
+        let (bytes_total, count_total) = if self.paused {
+            (Some(self.bytes), Some(self.count))
+        } else if cross_thread {
             (None, None)
         } else {
             let (bytes, count) = pop_alloc_stack();
-            (Some(bytes), Some(count))
+            (Some(self.bytes + bytes), Some(self.count + count))
         };
 
         send_alloc_measurement(
@@ -243,8 +253,62 @@ impl Drop for MeasurementGuardSync {
             duration_ns,
             elapsed_since_start_ns,
             self.wrapper,
-            Some(self.tid),
+            (!self.migrated && !cross_thread).then_some(self.tid),
         );
+    }
+}
+
+pin_project_lite::pin_project! {
+    #[doc(hidden)]
+    pub struct MeasuredAwait<F, Scopes> {
+        #[pin]
+        inner: F,
+        scopes: Scopes,
+    }
+}
+
+#[doc(hidden)]
+pub fn measure_block_await<'a, F: std::future::IntoFuture, const N: usize>(
+    future: F,
+    scopes: [&'a mut MeasurementGuardSync; N],
+) -> MeasuredAwait<F::IntoFuture, [&'a mut MeasurementGuardSync; N]> {
+    MeasuredAwait {
+        inner: future.into_future(),
+        scopes,
+    }
+}
+
+impl<F: std::future::Future, const N: usize> std::future::Future
+    for MeasuredAwait<F, [&mut MeasurementGuardSync; N]>
+{
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        for guard in &mut *this.scopes {
+            if guard.paused {
+                push_alloc_stack();
+                let tid = crate::tid::current_tid();
+                guard.migrated |= guard.tid != tid;
+                guard.tid = tid;
+                guard.paused = false;
+            }
+        }
+
+        let result = this.inner.poll(cx);
+        if result.is_pending() {
+            let _suspend = crate::lib_on::SuspendAllocTracking::new();
+            for guard in this.scopes.iter_mut().rev().filter(|guard| !guard.skipped) {
+                let (bytes, count) = pop_alloc_stack();
+                guard.bytes += bytes;
+                guard.count += count;
+                guard.paused = true;
+            }
+        }
+        result
     }
 }
 
@@ -576,6 +640,92 @@ mod tests {
     fn nesting_past_max_depth_panics_with_hint() {
         for _ in 0..=MAX_DEPTH {
             push_alloc_stack();
+        }
+    }
+
+    #[test]
+    fn async_block_tracks_macro_hidden_polls() {
+        use std::future::{poll_fn, Future};
+        use std::task::{Context, Poll, Waker};
+
+        macro_rules! hidden_await {
+            () => {
+                poll_fn(|_| {
+                    assert_eq!(
+                        crate::functions::alloc::core::ALLOCATIONS.with(|s| s.depth.get()),
+                        1
+                    );
+                    Poll::<()>::Pending
+                })
+                .await
+            };
+        }
+        let mut future = std::pin::pin!(hotpath::measure_block!(
+            "macro hidden async test",
+            async move {
+                hidden_await!();
+            }
+        ));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert_eq!(
+            crate::functions::alloc::core::ALLOCATIONS.with(|s| s.depth.get()),
+            0
+        );
+    }
+
+    #[test]
+    fn measured_block_releases_allocations_between_polls() {
+        use std::future::{poll_fn, ready, Future};
+        use std::task::{Context, Poll, Waker};
+
+        macro_rules! hidden_await {
+            ($future:expr) => {
+                $future.await
+            };
+        }
+
+        let depth = || crate::functions::alloc::core::ALLOCATIONS.with(|stack| stack.depth.get());
+        for cancel in [false, true] {
+            let mut pending = true;
+            let future = async move {
+                hotpath::measure_block!("block await test", {
+                    assert_eq!(depth(), 1);
+                    hotpath::measure_block!("nested block await test", {
+                        let future = poll_fn(|_| {
+                            assert_eq!(depth(), 2);
+                            if std::mem::take(&mut pending) {
+                                Poll::Pending
+                            } else {
+                                Poll::Ready(7)
+                            }
+                        });
+                        let value = if cancel {
+                            async { hidden_await!(future) }.await
+                        } else {
+                            future.await
+                        };
+                        // Distinct future types and temporaries must work at one site.
+                        ready(&String::from("abc")).await.len() + value
+                    })
+                })
+            };
+            let mut future = Box::pin(future);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(depth(), 0);
+            std::thread::spawn(move || {
+                if !cancel {
+                    let mut cx = Context::from_waker(Waker::noop());
+                    assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(10));
+                }
+                drop(future);
+                assert_eq!(depth(), 0);
+            })
+            .join()
+            .unwrap();
         }
     }
 }

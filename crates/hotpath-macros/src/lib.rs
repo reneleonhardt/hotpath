@@ -6,6 +6,80 @@ mod lib_on;
 #[cfg(not(feature = "hotpath"))]
 mod lib_off;
 
+#[cfg(feature = "hotpath-alloc")]
+#[doc(hidden)]
+#[proc_macro]
+pub fn __hotpath_block_awaits(input: TokenStream) -> TokenStream {
+    use syn::parse::{Parse, ParseStream};
+    use syn::visit_mut::{self, VisitMut};
+    use syn::{bracketed, parse_quote, Expr, Ident, Item, Macro, Token};
+
+    struct Awaits {
+        guards: Vec<Ident>,
+        wrap: Ident,
+    }
+
+    struct Block {
+        awaits: Awaits,
+        body: Expr,
+    }
+
+    impl Parse for Block {
+        fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+            let scope;
+            bracketed!(scope in input);
+            let guards = scope
+                .parse_terminated(Ident::parse, Token![,])?
+                .into_iter()
+                .collect();
+            input.parse::<Token![,]>()?;
+            let wrap = input.parse()?;
+            input.parse::<Token![,]>()?;
+            Ok(Self {
+                awaits: Awaits { guards, wrap },
+                body: input.parse()?,
+            })
+        }
+    }
+
+    impl VisitMut for Awaits {
+        fn visit_expr_mut(&mut self, expr: &mut Expr) {
+            match expr {
+                Expr::Async(_) | Expr::Closure(_) | Expr::Const(_) => {}
+                Expr::Await(awaited) => {
+                    self.visit_expr_mut(&mut awaited.base);
+                    let (guards, wrap, future) = (&self.guards, &self.wrap, &awaited.base);
+                    *awaited.base = parse_quote!(#wrap(#future, [#(&mut #guards),*]));
+                }
+                _ => visit_mut::visit_expr_mut(self, expr),
+            }
+        }
+
+        fn visit_macro_mut(&mut self, mac: &mut Macro) {
+            // Forward lexical scopes only to the qualified Hotpath macro.
+            let mut path = mac.path.segments.iter();
+            if path.next().is_some_and(|part| part.ident == "hotpath")
+                && path
+                    .next()
+                    .is_some_and(|part| part.ident == "measure_block")
+                && path.next().is_none()
+            {
+                let (guards, args) = (&self.guards, &mac.tokens);
+                mac.tokens = quote::quote!(@scopes [#(#guards),*] #args);
+            }
+        }
+
+        fn visit_item_mut(&mut self, _: &mut Item) {}
+    }
+
+    let Block {
+        mut awaits,
+        mut body,
+    } = syn::parse_macro_input!(input as Block);
+    awaits.visit_expr_mut(&mut body);
+    quote::quote!(#body).into()
+}
+
 /// Initializes the hotpath profiling system and generates a performance report on program exit.
 ///
 /// Apply to `main` (or another entry point) to enable profiling: starts the background

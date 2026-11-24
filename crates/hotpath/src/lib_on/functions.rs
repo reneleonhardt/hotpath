@@ -28,7 +28,7 @@ cfg_if::cfg_if! {
         pub(crate) mod alloc;
         pub(crate) use alloc::state::{FunctionsState, Measurement};
         pub(crate) use alloc::guard::AsyncAllocBridge;
-        pub use alloc::guard::{MeasurementGuardAsync, MeasurementGuardSync};
+        pub use alloc::guard::{MeasurementGuardAsync, MeasurementGuardSync, measure_block_await};
         pub(crate) use alloc::guard::MeasurementGuardSyncWithLog;
         #[doc(hidden)]
         pub use alloc::guard::MeasurementGuardAsyncWithLog;
@@ -208,6 +208,70 @@ fn build_measurement_guard_async_with_log_bridge(
     }
 }
 
+enum BlockMeasurement {
+    Unpolled {
+        name: &'static str,
+        bridge: Option<std::sync::Arc<AsyncAllocBridge>>,
+        skipped: bool,
+    },
+    Active(MeasurementGuardAsync),
+}
+
+#[doc(hidden)]
+pub struct AsyncBlockGuard(BlockMeasurement);
+
+impl<T> AsyncGuardFinish<T> for AsyncBlockGuard {
+    fn begin_poll(&mut self) {
+        if let BlockMeasurement::Unpolled {
+            name,
+            bridge,
+            skipped,
+        } = &mut self.0
+        {
+            let _suspend = crate::lib_on::SuspendAllocTracking::new();
+            #[cfg(feature = "hotpath-alloc")]
+            let guard = MeasurementGuardAsync::new(name, false, *skipped, bridge.take());
+            #[cfg(not(feature = "hotpath-alloc"))]
+            let guard = {
+                let _ = bridge;
+                MeasurementGuardAsync::new(name, false, *skipped)
+            };
+            self.0 = BlockMeasurement::Active(guard);
+        }
+    }
+
+    fn finish(self, _output: &T) {
+        if let BlockMeasurement::Active(guard) = self.0 {
+            drop(guard);
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn measure_async_block<F: Future>(
+    name: &'static str,
+    future: F,
+) -> MeasuredFuture<crate::futures::wrapper::InstrumentedFuture<F>, AsyncBlockGuard> {
+    let _suspend = crate::lib_on::SuspendAllocTracking::new();
+    let skipped = !is_focused(name);
+    let bridge = make_alloc_bridge(skipped);
+    MeasuredFuture {
+        inner: crate::futures::wrapper::InstrumentedFuture::new(
+            future,
+            name,
+            None,
+            bridge.clone(),
+            false,
+            (!skipped).then_some(name),
+        ),
+        guard: Some(AsyncBlockGuard(BlockMeasurement::Unpolled {
+            name,
+            bridge,
+            skipped,
+        })),
+    }
+}
+
 /// Internal helper used by `#[hotpath::measure(log = true)]` for sync functions.
 ///
 /// `measurement_loc` is the fully-qualified function path used as the metrics key.
@@ -246,6 +310,8 @@ pin_project_lite::pin_project! {
 /// guards also record the output value.
 #[doc(hidden)]
 pub trait AsyncGuardFinish<T> {
+    fn begin_poll(&mut self) {}
+
     fn finish(self, output: &T);
 }
 
@@ -275,6 +341,9 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = self.project();
+        if let Some(guard) = this.guard.as_mut() {
+            guard.begin_poll();
+        }
         match this.inner.poll(cx) {
             std::task::Poll::Ready(output) => {
                 // Same order as the former `async fn`: the instrumented body has finished its
@@ -702,6 +771,28 @@ pub(crate) fn get_function_logs_alloc(function_id: u32) -> Option<Option<Functio
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn async_block_starts_measurement_on_first_poll() {
+        use std::future::{pending, Future};
+        use std::task::{Context, Waker};
+
+        use crate::functions::{measure_async_block, BlockMeasurement};
+
+        let mut future = std::pin::pin!(measure_async_block("first poll", pending::<()>()));
+        assert!(matches!(
+            future.guard.as_ref().unwrap().0,
+            BlockMeasurement::Unpolled { .. }
+        ));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert!(matches!(
+            future.guard.as_ref().unwrap().0,
+            BlockMeasurement::Active(_)
+        ));
+    }
+
     use crate::lib_on::functions::function_name;
 
     #[test]

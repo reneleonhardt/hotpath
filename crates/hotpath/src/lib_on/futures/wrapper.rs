@@ -18,11 +18,24 @@ use crate::instant::Instant;
 
 #[cfg(feature = "hotpath-alloc")]
 #[inline]
-fn measure_poll_alloc<R>(poll_fn: impl FnOnce() -> R) -> (R, Option<u64>, Option<u64>) {
+fn measure_poll_alloc<R>(
+    bridge: Option<&AsyncAllocBridge>,
+    poll_fn: impl FnOnce() -> R,
+) -> (R, Option<u64>, Option<u64>) {
+    struct Frame<'a>(Option<&'a AsyncAllocBridge>);
+    impl Drop for Frame<'_> {
+        fn drop(&mut self) {
+            let (bytes, count) = crate::functions::alloc::guard::pop_alloc_stack();
+            if let Some(bridge) = self.0 {
+                bridge.add(bytes, count);
+            }
+        }
+    }
+
     crate::functions::alloc::guard::push_alloc_stack();
-
+    let frame = Frame(bridge);
     let result = poll_fn();
-
+    std::mem::forget(frame);
     let (bytes, count) = crate::functions::alloc::guard::pop_alloc_stack();
 
     (result, Some(bytes), Some(count))
@@ -30,7 +43,10 @@ fn measure_poll_alloc<R>(poll_fn: impl FnOnce() -> R) -> (R, Option<u64>, Option
 
 #[cfg(not(feature = "hotpath-alloc"))]
 #[inline]
-fn measure_poll_alloc<R>(poll_fn: impl FnOnce() -> R) -> (R, Option<u64>, Option<u64>) {
+fn measure_poll_alloc<R>(
+    _bridge: Option<&AsyncAllocBridge>,
+    poll_fn: impl FnOnce() -> R,
+) -> (R, Option<u64>, Option<u64>) {
     (poll_fn(), None, None)
 }
 
@@ -165,10 +181,14 @@ impl<F: Future> Future for InstrumentedFuture<F> {
 
         // Don't instrument future unless visible, only collect alloc data
         if !visible {
-            let (result, poll_alloc_bytes, poll_alloc_count) = measure_poll_alloc(|| {
-                let _caller_scope = CallerScopeGuard::enter(*this.caller_scope);
-                this.inner.poll(cx)
-            });
+            if this.alloc_bridge.is_none() && this.caller_scope.is_none() {
+                return this.inner.poll(cx);
+            }
+            let (result, poll_alloc_bytes, poll_alloc_count) =
+                measure_poll_alloc(this.alloc_bridge.as_deref(), || {
+                    let _caller_scope = CallerScopeGuard::enter(*this.caller_scope);
+                    this.inner.poll(cx)
+                });
             if let (Some(bytes), Some(count), Some(bridge)) = (
                 poll_alloc_bytes,
                 poll_alloc_count,
@@ -186,10 +206,11 @@ impl<F: Future> Future for InstrumentedFuture<F> {
         let call_id = *this.call_id;
 
         let start = (*this.timed).then(Instant::now);
-        let (result, poll_alloc_bytes, poll_alloc_count) = measure_poll_alloc(|| {
-            let _caller_scope = CallerScopeGuard::enter(*this.caller_scope);
-            this.inner.poll(cx)
-        });
+        let (result, poll_alloc_bytes, poll_alloc_count) =
+            measure_poll_alloc(this.alloc_bridge.as_deref(), || {
+                let _caller_scope = CallerScopeGuard::enter(*this.caller_scope);
+                this.inner.poll(cx)
+            });
         let poll_duration_ns =
             start.map(|start| Instant::now().duration_since(start).as_nanos() as u64);
         if let (Some(bytes), Some(count), Some(bridge)) = (
@@ -339,10 +360,14 @@ where
         let visible = *this.visible;
 
         if !visible {
-            let (result, poll_alloc_bytes, poll_alloc_count) = measure_poll_alloc(|| {
-                let _caller_scope = CallerScopeGuard::enter(*this.caller_scope);
-                this.inner.poll(cx)
-            });
+            if this.alloc_bridge.is_none() && this.caller_scope.is_none() {
+                return this.inner.poll(cx);
+            }
+            let (result, poll_alloc_bytes, poll_alloc_count) =
+                measure_poll_alloc(this.alloc_bridge.as_deref(), || {
+                    let _caller_scope = CallerScopeGuard::enter(*this.caller_scope);
+                    this.inner.poll(cx)
+                });
             if let (Some(bytes), Some(count), Some(bridge)) = (
                 poll_alloc_bytes,
                 poll_alloc_count,
@@ -360,10 +385,11 @@ where
         let call_id = *this.call_id;
 
         let start = (*this.timed).then(Instant::now);
-        let (result, poll_alloc_bytes, poll_alloc_count) = measure_poll_alloc(|| {
-            let _caller_scope = CallerScopeGuard::enter(*this.caller_scope);
-            this.inner.poll(cx)
-        });
+        let (result, poll_alloc_bytes, poll_alloc_count) =
+            measure_poll_alloc(this.alloc_bridge.as_deref(), || {
+                let _caller_scope = CallerScopeGuard::enter(*this.caller_scope);
+                this.inner.poll(cx)
+            });
         let poll_duration_ns =
             start.map(|start| Instant::now().duration_since(start).as_nanos() as u64);
         if let (Some(bytes), Some(count), Some(bridge)) = (
@@ -403,5 +429,43 @@ where
         }
 
         result
+    }
+}
+
+#[cfg(all(test, feature = "hotpath-alloc"))]
+mod tests {
+    #[test]
+    fn filtered_and_unwinding_polls_restore_the_allocation_stack() {
+        use std::future::{poll_fn, Future};
+        use std::task::{Context, Poll, Waker};
+
+        use crate::functions::alloc::core::ALLOCATIONS;
+        use crate::lib_on::futures::wrapper::{measure_poll_alloc, InstrumentedFuture};
+
+        let depth = || ALLOCATIONS.with(|stack| stack.depth.get());
+        let bridge = crate::functions::AsyncAllocBridge::default();
+        assert!(
+            std::panic::catch_unwind(|| measure_poll_alloc(Some(&bridge), || {
+                crate::functions::alloc::core::track_alloc(32);
+                panic!();
+            }))
+            .is_err()
+        );
+        assert_eq!(depth(), 0);
+        assert_eq!(bridge.snapshot(), (Some(32), Some(1)));
+        let mut future = std::pin::pin!(InstrumentedFuture::new(
+            poll_fn(|_| Poll::Ready(depth())),
+            "filtered",
+            None,
+            None,
+            false,
+            None,
+        ));
+        assert_eq!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(0)
+        );
     }
 }

@@ -211,7 +211,11 @@ impl Drop for SuspendAllocTracking {
 ///
 /// The macro automatically uses the appropriate measurement based on enabled feature flags:
 /// - **Time profiling** (default): Measures execution duration
-/// - **Allocation profiling**: Tracks memory allocations when allocation features are enabled
+/// - **Allocation profiling**: Tracks allocations while the block is running.
+///   Explicit `.await` expressions suspend tracking when the future is pending.
+///   Nested `hotpath::measure_block!` calls share these poll boundaries.
+///   For code that suspends through another macro, use the async form
+///   `hotpath::measure_block!(label, async { ... }).await` to measure the future from its first poll.
 ///
 /// # Examples
 ///
@@ -232,15 +236,43 @@ impl Drop for SuspendAllocTracking {
 /// * [`main`](hotpath_macros::main) - Attribute macro that initializes profiling
 #[macro_export]
 macro_rules! measure_block {
-    ($label:literal, $expr:expr) => {{
-        let __hotpath_label = $crate::__hotpath_block_label!($label);
-        let _guard = $crate::functions::build_measurement_guard_block(__hotpath_label, false);
-        $expr
+    ($(@scopes [$($parent:ident),*])? $label:literal, async $($capture:ident)? $body:block) => {{
+        $crate::functions::measure_async_block($crate::__hotpath_block_label!($label), async $($capture)? $body)
     }};
+    ($(@scopes [$($parent:ident),*])? $label:expr, async $($capture:ident)? $body:block) => {{
+        $crate::functions::measure_async_block($crate::__hotpath_block_label!($label), async $($capture)? $body)
+    }};
+    ($(@scopes [$($parent:ident),*])? $label:literal, $expr:expr) => {{
+        $crate::__hotpath_measure_block!([$($($parent),*)?], $crate::__hotpath_block_label!($label), $expr)
+    }};
+    ($(@scopes [$($parent:ident),*])? $label:expr, $expr:expr) => {{
+        $crate::__hotpath_measure_block!([$($($parent),*)?], $crate::__hotpath_block_label!($label), $expr)
+    }};
+}
 
-    ($label:expr, $expr:expr) => {{
-        let __hotpath_label = $crate::__hotpath_block_label!($label);
-        let _guard = $crate::functions::build_measurement_guard_block(__hotpath_label, false);
+#[cfg(feature = "hotpath-alloc")]
+#[doc(hidden)]
+pub use hotpath_macros::__hotpath_block_awaits;
+
+#[cfg(feature = "hotpath-alloc")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __hotpath_measure_block {
+    ([$($parent:ident),*], $label:expr, $expr:expr) => {{
+        #[allow(unused_mut)]
+        let mut guard = $crate::functions::build_measurement_guard_block($label, false);
+        #[allow(unused_imports)]
+        use $crate::functions::measure_block_await as __hotpath_wrap_await;
+        $crate::__hotpath_block_awaits!([$($parent,)* guard], __hotpath_wrap_await, $expr)
+    }};
+}
+
+#[cfg(not(feature = "hotpath-alloc"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __hotpath_measure_block {
+    ([], $label:expr, $expr:expr) => {{
+        let _guard = $crate::functions::build_measurement_guard_block($label, false);
         $expr
     }};
 }
