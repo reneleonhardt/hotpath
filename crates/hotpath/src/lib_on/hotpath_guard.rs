@@ -772,7 +772,7 @@ impl HotpathGuard {
                                                     continue;
                                                 }
                                                 let formatted = build_functions_list_alloc(
-                                                    &local_stats, &config, current_elapsed_ns,
+                                                    &local_stats, &config, current_elapsed_ns, None,
                                                 );
                                                 let _ = response_tx.send(Some(formatted));
                                             } else {
@@ -1087,80 +1087,41 @@ fn build_icount_list(
 
 impl Drop for HotpathGuard {
     fn drop(&mut self) {
-        let _suspend = crate::lib_on::SuspendAllocTracking::new();
-
-        #[cfg(feature = "hotpath-cpu")]
-        let cpu_report: Option<Result<crate::functions::cpu::CpuReport, String>> = if self
-            .sections_mode
-            .contains_or_auto(Section::FunctionsCpu)
-        {
-            let caller_name = self
-                .state
-                .read()
-                .map(|state| state.caller_name)
-                .unwrap_or("unknown");
-            match crate::functions::cpu::autospawn::stop() {
-                Ok(profile_path) => {
-                    match crate::functions::cpu::build_cpu_report_from_path(
-                        caller_name,
-                        &profile_path,
-                    ) {
-                        Some(r) => {
-                            info!(
-                                    "cpu report: caller={caller_name} total_samples={} attributed_samples={} stats_rows={}",
-                                    r.total_samples,
-                                    r.attributed_samples,
-                                    r.stats.len()
-                                );
-                            Some(Ok(r))
-                        }
-                        None => {
-                            let msg = format!(
-                                "no data parsed from samply profile {}",
-                                profile_path.display()
-                            );
-                            warn!("cpu report: {msg}");
-                            Some(Err(msg))
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("cpu report: {e}");
-                    Some(Err(e))
-                }
-            }
-        } else {
-            None
-        };
-
         if let Some(f) = self.before_shutdown.take() {
             f();
         }
 
-        let wrapper_guard = self.wrapper_guard.take().unwrap();
-        drop(wrapper_guard);
+        let end_time = Instant::now();
+        let _suspend = crate::lib_on::SuspendAllocTracking::new();
+        drop(self.wrapper_guard.take().unwrap());
 
-        // Stop producers before signalling shutdown: everything published up to
-        // this point is caught by the worker's final sweep.
+        // Close the run before collecting or formatting reports.
         set_measurements_active(false);
+        #[cfg(all(feature = "threads", feature = "hotpath-alloc"))]
+        crate::functions::alloc::core::stop_thread_alloc_tracking();
+
+        #[cfg(feature = "hotpath-cpu")]
+        let cpu_profile = self
+            .sections_mode
+            .contains_or_auto(Section::FunctionsCpu)
+            .then(crate::functions::cpu::autospawn::stop);
 
         let state: Arc<crate::lib_on::MetaRwLock<FunctionsState>> = Arc::clone(&self.state);
-        let elapsed = self.start_time.elapsed();
+        let elapsed = end_time.duration_since(self.start_time);
         let percentiles = state
             .read()
             .map(|s| s.percentiles.clone())
             .unwrap_or_default();
 
-        let (shutdown_tx, completion_rx, end_time) = {
+        let (shutdown_tx, completion_rx) = {
             let Ok(mut state_guard) = state.write() else {
                 return;
             };
 
             let shutdown_tx = state_guard.shutdown_tx.take();
-            let end_time = Instant::now();
 
             let completion_rx = state_guard.completion_rx.take();
-            (shutdown_tx, completion_rx, end_time)
+            (shutdown_tx, completion_rx)
         };
 
         if let Some(tx) = shutdown_tx {
@@ -1169,6 +1130,32 @@ impl Drop for HotpathGuard {
 
         let functions_stats =
             completion_rx.and_then(|rx_mutex| rx_mutex.lock().ok().and_then(|rx| rx.recv().ok()));
+        #[cfg(feature = "hotpath-cpu")]
+        let cpu_report = cpu_profile.map(|profile| {
+            let report = profile.and_then(|path| {
+                let stats = functions_stats
+                    .as_ref()
+                    .ok_or_else(|| "function measurements unavailable".to_string())?;
+                let names = stats.values().map(|s| (s.name, s.id)).collect();
+                let caller = state.read().map(|s| s.caller_name).unwrap_or("unknown");
+                crate::functions::cpu::build_cpu_report_from_path(caller, &path, Some(names))
+                    .ok_or_else(|| format!("no data parsed from samply profile {}", path.display()))
+            });
+            match &report {
+                Ok(report) => info!(
+                    "cpu report: caller={} total_samples={} attributed_samples={} stats_rows={}",
+                    report.caller_name,
+                    report.total_samples,
+                    report.attributed_samples,
+                    report.stats.len()
+                ),
+                Err(error) => warn!("cpu report: {error}"),
+            }
+            report
+        });
+        #[cfg(feature = "hotpath-alloc")]
+        let completed_roots = (*crate::functions::alloc::guard::ALLOC_CUMULATIVE)
+            .then(crate::functions::alloc::core::root_alloc_totals);
 
         // Drain every subsystem regardless of the configured sections: each
         // shutdown_* is a no-op when the subsystem was never instrumented, and
@@ -1382,7 +1369,7 @@ impl Drop for HotpathGuard {
                                         let elapsed_ns = total_elapsed.as_nanos() as u64;
                                         let config = make_functions_config(&state_guard, total_elapsed, limit_for, cloud_report);
                                         report.functions_alloc = Some(
-                                            build_functions_list_alloc(stats, &config, elapsed_ns),
+                                            build_functions_list_alloc(stats, &config, elapsed_ns, completed_roots),
                                         );
                                     }
                                 }
@@ -1699,7 +1686,7 @@ impl Drop for HotpathGuard {
                                         let total_elapsed = end_time.duration_since(state_guard.start_time);
                                         let config = make_functions_config(&state_guard, total_elapsed, |limit| limit, false);
                                         let elapsed_ns = total_elapsed.as_nanos() as u64;
-                                        let list = build_functions_list_alloc(stats, &config, elapsed_ns);
+                                        let list = build_functions_list_alloc(stats, &config, elapsed_ns, completed_roots);
 
                                         match format {
                                             Format::Table => {

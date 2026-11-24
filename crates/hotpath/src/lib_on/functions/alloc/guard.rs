@@ -79,16 +79,17 @@ pub(crate) fn pop_alloc_stack() -> (u64, u64) {
         let bytes = stack.elements[depth].bytes_total.get();
         let count = stack.elements[depth].count_total.get();
 
-        stack.depth.set(stack.depth.get() - 1);
+        let parent = depth - 1;
+        stack.depth.set(parent as u32);
 
         if *ALLOC_CUMULATIVE {
-            let parent = stack.depth.get() as usize;
-            stack.elements[parent]
-                .bytes_total
-                .set(stack.elements[parent].bytes_total.get() + bytes);
-            stack.elements[parent]
-                .count_total
-                .set(stack.elements[parent].count_total.get() + count);
+            if parent == 0 {
+                crate::functions::alloc::state::record_root_allocations(bytes, count);
+            } else {
+                let parent = &stack.elements[parent];
+                parent.bytes_total.set(parent.bytes_total.get() + bytes);
+                parent.count_total.set(parent.count_total.get() + count);
+            }
         }
 
         (bytes, count)

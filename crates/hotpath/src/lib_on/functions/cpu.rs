@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,8 +43,9 @@ pub(crate) struct CpuReport {
 pub(crate) fn build_cpu_report_from_path(
     caller_name: &'static str,
     path: &Path,
+    final_names: Option<HashMap<&'static str, u32>>,
 ) -> Option<CpuReport> {
-    samply::build_cpu_report_from_path(caller_name, path)
+    samply::build_cpu_report_from_path(caller_name, path, final_names)
 }
 
 struct SnapshotState {
@@ -110,7 +112,7 @@ fn run_snapshot() {
     };
 
     let caller_name = "snapshot";
-    let report = match build_cpu_report_from_path(caller_name, &path) {
+    let report = match build_cpu_report_from_path(caller_name, &path, None) {
         Some(r) => r,
         None => {
             set_snapshot_error("failed to parse samply profile");

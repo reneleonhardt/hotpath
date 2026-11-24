@@ -13,26 +13,30 @@ thread_local! {
     static MEASUREMENT_PRODUCER: EventProducer<Measurement> = MEASUREMENT_QUEUES.register();
 }
 
-/// Set when an event could not be enqueued (its thread's producer was already
-/// torn down); allocation queries fail for the rest of the session.
-#[cfg(feature = "hotpath-ordered-drain")]
-static LOST_MEASUREMENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[inline]
+pub(crate) fn record_root_allocations(bytes: u64, count: u64) {
+    if count != 0 && MEASUREMENT_QUEUES.is_active() {
+        crate::functions::alloc::core::record_root_allocations(bytes, count);
+    }
+}
 
 fn add_measurement(m: Measurement) {
     if !MEASUREMENT_QUEUES.is_active() {
         return;
     }
-    let _result = MEASUREMENT_PRODUCER.try_with(|producer| producer.push(m));
-    #[cfg(feature = "hotpath-ordered-drain")]
-    if _result.is_err() {
-        LOST_MEASUREMENTS.store(true, std::sync::atomic::Ordering::Release);
+    let mut measurement = Some(m);
+    if MEASUREMENT_PRODUCER
+        .try_with(|producer| producer.push(measurement.take().unwrap()))
+        .is_err()
+    {
+        // A user TLS destructor can run after its usual producer was dropped.
+        MEASUREMENT_QUEUES.register().push(measurement.unwrap());
     }
 }
 
 pub(crate) fn set_measurements_active(active: bool) {
-    #[cfg(feature = "hotpath-ordered-drain")]
-    if active {
-        LOST_MEASUREMENTS.store(false, std::sync::atomic::Ordering::Release);
+    if active && *crate::functions::alloc::guard::ALLOC_CUMULATIVE {
+        crate::functions::alloc::core::reset_root_allocations();
     }
     MEASUREMENT_QUEUES.set_active(active);
 }
@@ -47,7 +51,7 @@ pub(crate) fn drain_all_measurements(out: &mut Vec<Measurement>) {
 
 /// Sweeps until every event published before the call is processed, so an
 /// allocation query sees more than one capped sweep. `false` means the query
-/// must fail: an event was lost, the registry is poisoned, `timeout` elapsed
+/// must fail: the registry is poisoned, `timeout` elapsed
 /// or shutdown is pending. The snapshot is fixed, so producers that keep
 /// publishing cannot stall it.
 #[cfg(feature = "hotpath-ordered-drain")]
@@ -73,7 +77,7 @@ pub(crate) fn drain_published(
         }
         swept.drain(..).for_each(&mut process);
     }
-    !LOST_MEASUREMENTS.load(std::sync::atomic::Ordering::Acquire)
+    true
 }
 
 #[derive(Debug)]

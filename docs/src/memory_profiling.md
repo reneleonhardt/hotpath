@@ -150,7 +150,7 @@ Total: 6.3 MB
 +-----------------------------+-------+---------+---------+--------+---------+
 ```
 
-Cumulative mode answers "how much does this whole call tree allocate", which is useful for comparing top-level entry points such as request handlers. The rows overlap, so their percentages no longer add up to 100%. It also produces invalid results for recursive functions: the same allocation is counted once in every recursive frame it propagates through.
+Cumulative mode answers "how much does this whole call tree allocate", which is useful for comparing top-level entry points such as request handlers. The final total counts each allocation once across completed outermost scopes on all measured threads. The rows overlap, so their percentages no longer add up to 100%. It also produces invalid results for recursive functions: the same allocation is counted once in every recursive frame it propagates through.
 
 ## Monitor memory allocations per thread
 
@@ -161,7 +161,7 @@ The [threads](threads.md) section of the report and the TUI Threads tab track ev
 - **Alloc / Dealloc** - total bytes allocated and deallocated by the thread that performed the operation.
 - **Diff** - Alloc minus Dealloc for that thread.
 
-Threads that already exited keep their counters, so short-lived worker threads still show up in the final report. Rows are sorted by allocation traffic, and the number of rows in the final report is capped by `threads_limit` / `HOTPATH_THREADS_LIMIT` (default: 5). The header line also shows process-wide Alloc, Dealloc and Diff totals across all threads.
+Threads that already exited keep their counters, so short-lived worker threads still show up in the final report. Rows are sorted by allocation traffic, and the number of rows in the final report is capped by `threads_limit` / `HOTPATH_THREADS_LIMIT` (default: 5). The header line also shows process-wide Alloc, Dealloc and Diff totals for the profiling run. Allocations made by Hotpath’s internal threads are hidden by default.
 
 To find the threads responsible for heavy allocation traffic, compare their Alloc and Dealloc columns: high values on both sides mean the thread churns through short-lived allocations. In the live TUI, press `4` to open the Threads tab and watch the counters update in real time:
 

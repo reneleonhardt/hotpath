@@ -124,6 +124,37 @@ pub mod tests {
         }
     }
 
+    #[test]
+    fn final_totals_include_workers_and_cleanup() {
+        let report = Example::new("test-alloc", "run_totals")
+            .features("hotpath-alloc")
+            .env("HOTPATH_REPORT", "functions-alloc,functions-timing,threads")
+            .env("HOTPATH_ALLOC_CUMULATIVE", "1")
+            .env("HOTPATH_ALLOC_METRIC", "bytes")
+            .env("HOTPATH_FUNCTIONS_TIME_SAMPLING_RATE", "1")
+            .json()
+            .report();
+        let alloc = report.functions_alloc.unwrap();
+        assert_eq!(alloc.total_allocated.as_deref(), Some("48 B"));
+        let timing = report.functions_timing.unwrap();
+        for data in [&alloc.data, &timing.data] {
+            let work = data
+                .iter()
+                .find(|entry| entry.name == "run_totals::work")
+                .unwrap();
+            assert_eq!((work.calls, work.sampled_calls), (3, 3));
+        }
+        let worker = alloc
+            .data
+            .iter()
+            .find(|entry| entry.name == "run_totals::worker")
+            .unwrap();
+        assert_eq!(worker.total, "8 B");
+        let threads = report.threads.unwrap();
+        assert_eq!(threads.total_alloc_bytes.as_deref(), Some("48 B"));
+        assert_eq!(threads.total_dealloc_bytes.as_deref(), Some("48 B"));
+    }
+
     // HOTPATH_METRICS_PORT=6775 TEST_SLEEP_SECONDS=10 cargo run -p test-tokio-async --example basic --features hotpath-alloc
     #[test]
     fn test_data_endpoints() {

@@ -16,6 +16,7 @@ use crate::lib_on::functions::cpu::{CpuFunctionStats, CpuReport, CPU_INCLUSIVE};
 pub(crate) fn build_cpu_report_from_path(
     caller_name: &'static str,
     path: &Path,
+    final_names: Option<HashMap<&'static str, u32>>,
 ) -> Option<CpuReport> {
     info!("cpu report: loading samply profile from {}", path.display());
 
@@ -30,12 +31,11 @@ pub(crate) fn build_cpu_report_from_path(
         }
     };
 
-    let display_to_id = match crate::lib_on::functions::get_instrumented_names_and_ids() {
-        Some(display_to_id) => display_to_id,
-        None => {
-            warn!("cpu report: instrumented function registry unavailable; skipping CPU report");
-            return None;
-        }
+    let Some(display_to_id) =
+        final_names.or_else(crate::lib_on::functions::get_instrumented_names_and_ids)
+    else {
+        warn!("cpu report: instrumented function registry unavailable; skipping CPU report");
+        return None;
     };
 
     if display_to_id.is_empty() {
@@ -868,6 +868,20 @@ mod tests {
             assert_eq!(weights, HashMap::from([(0, 6), (1, 0)]));
             assert_eq!(visits, if stack_count == 2 { 2 } else { 4 });
         }
+    }
+
+    #[test]
+    fn final_cpu_report_uses_supplied_function_names() {
+        let path =
+            std::env::temp_dir().join(format!("hotpath-final-cpu-{}.json", std::process::id()));
+        std::fs::write(&path, "{}").unwrap();
+        let report = crate::functions::cpu::build_cpu_report_from_path(
+            "run",
+            &path,
+            Some(HashMap::from([("work", 1)])),
+        );
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(report.unwrap().caller_name, "run");
     }
 
     #[test]

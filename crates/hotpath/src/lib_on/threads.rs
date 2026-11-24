@@ -411,7 +411,9 @@ pub(crate) fn get_threads_json(precision: Precision) -> JsonThreadsList {
         },
     );
 
-    let has_alloc_data = current_metrics.iter().any(|m| m.alloc_bytes.is_some());
+    let has_alloc_data = raw.overflow_alloc_bytes != 0
+        || raw.overflow_dealloc_bytes != 0
+        || current_metrics.iter().any(|m| m.alloc_bytes.is_some());
 
     let (total_alloc_bytes, total_dealloc_bytes, alloc_dealloc_diff) = if has_alloc_data {
         let diff = total_alloc as i64 - total_dealloc as i64;

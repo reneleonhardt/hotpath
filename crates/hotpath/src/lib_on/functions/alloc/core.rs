@@ -48,6 +48,8 @@ pub(crate) struct ThreadAllocStats {
     pub(crate) tid: AtomicU64,
     pub(crate) alloc_bytes: AtomicU64,
     pub(crate) dealloc_bytes: AtomicU64,
+    root_alloc_bytes: AtomicU64,
+    root_alloc_count: AtomicU64,
     /// Length of `name`; 0 = no name captured. Stored with Release after the
     /// name bytes, so a reader observing a non-zero length sees the full name.
     name_len: AtomicU32,
@@ -66,6 +68,8 @@ impl ThreadAllocStats {
             tid: AtomicU64::new(0),
             alloc_bytes: AtomicU64::new(0),
             dealloc_bytes: AtomicU64::new(0),
+            root_alloc_bytes: AtomicU64::new(0),
+            root_alloc_count: AtomicU64::new(0),
             name_len: AtomicU32::new(0),
             name: [const { AtomicU8::new(0) }; THREAD_NAME_LEN],
         }
@@ -107,22 +111,71 @@ static THREAD_TRACKING_ENABLED: AtomicU64 = AtomicU64::new(0);
 static OVERFLOW_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static OVERFLOW_DEALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
+static OVERFLOW_ROOT_BYTES: AtomicU64 = AtomicU64::new(0);
+static OVERFLOW_ROOT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn reset_root_allocations() {
+    std::sync::LazyLock::force(&crate::lib_on::SHOW_INTERNAL_THREADS);
+    for slot in &THREAD_ALLOC_STATS {
+        if slot.tid.load(Ordering::Acquire) == 0 {
+            break;
+        }
+        slot.root_alloc_bytes.store(0, Ordering::Relaxed);
+        slot.root_alloc_count.store(0, Ordering::Relaxed);
+    }
+    OVERFLOW_ROOT_BYTES.store(0, Ordering::Relaxed);
+    OVERFLOW_ROOT_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn record_root_allocations(bytes: u64, count: u64) {
+    let (total_bytes, total_count) = match thread_slot() {
+        ThreadSlot::Tracked(slot) => (&slot.root_alloc_bytes, &slot.root_alloc_count),
+        ThreadSlot::Overflow | ThreadSlot::Internal => (&OVERFLOW_ROOT_BYTES, &OVERFLOW_ROOT_COUNT),
+    };
+    total_bytes.fetch_add(bytes, Ordering::Relaxed);
+    total_count.fetch_add(count, Ordering::Relaxed);
+}
+
+pub(crate) fn root_alloc_totals() -> (u64, u64) {
+    let mut bytes = OVERFLOW_ROOT_BYTES.load(Ordering::Relaxed);
+    let mut count = OVERFLOW_ROOT_COUNT.load(Ordering::Relaxed);
+    for slot in &THREAD_ALLOC_STATS {
+        if slot.tid.load(Ordering::Acquire) == 0 {
+            break;
+        }
+        bytes += slot.root_alloc_bytes.load(Ordering::Relaxed);
+        count += slot.root_alloc_count.load(Ordering::Relaxed);
+    }
+    (bytes, count)
+}
+
 /// Initialize the thread allocation tracking system
 #[cfg_attr(not(feature = "threads"), allow(dead_code))]
 pub(crate) fn init_thread_alloc_tracking() {
     // Read inside the allocator from here on, where a first-use env lookup
     // would allocate and re-enter it.
     std::sync::LazyLock::force(&crate::lib_on::SHOW_INTERNAL_THREADS);
+    for slot in &THREAD_ALLOC_STATS {
+        if slot.tid.load(Ordering::Acquire) == 0 {
+            break;
+        }
+        slot.alloc_bytes.store(0, Ordering::Relaxed);
+        slot.dealloc_bytes.store(0, Ordering::Relaxed);
+    }
+    OVERFLOW_ALLOC_BYTES.store(0, Ordering::Relaxed);
+    OVERFLOW_DEALLOC_BYTES.store(0, Ordering::Relaxed);
     THREAD_TRACKING_ENABLED.store(1, Ordering::Release);
+}
+
+#[cfg(feature = "threads")]
+pub(crate) fn stop_thread_alloc_tracking() {
+    THREAD_TRACKING_ENABLED.store(0, Ordering::Release);
 }
 
 /// Get allocation stats for a thread
 #[cfg_attr(not(feature = "threads"), allow(dead_code))]
 pub(crate) fn get_thread_alloc_stats(os_tid: u64) -> Option<(u64, u64)> {
-    if THREAD_TRACKING_ENABLED.load(Ordering::Acquire) == 0 {
-        return None;
-    }
-
     for slot in &THREAD_ALLOC_STATS {
         let slot_tid = slot.tid.load(Ordering::Acquire);
         if slot_tid == os_tid {
@@ -281,12 +334,11 @@ pub(crate) fn get_registered_thread_stats() -> Vec<(u64, u64, u64, Option<String
         if slot_tid == 0 {
             break;
         }
-        stats.push((
-            slot_tid,
-            slot.alloc_bytes.load(Ordering::Relaxed),
-            slot.dealloc_bytes.load(Ordering::Relaxed),
-            slot.name(),
-        ));
+        let alloc = slot.alloc_bytes.load(Ordering::Relaxed);
+        let dealloc = slot.dealloc_bytes.load(Ordering::Relaxed);
+        if alloc != 0 || dealloc != 0 {
+            stats.push((slot_tid, alloc, dealloc, slot.name()));
+        }
     }
     stats
 }

@@ -11,6 +11,7 @@ pub(crate) fn build_functions_list_alloc(
     stats: &HashMap<u32, FunctionStats>,
     config: &FunctionStatsConfig,
     current_elapsed_ns: u64,
+    completed_roots: Option<(u64, u64)>,
 ) -> JsonFunctionsList {
     use crate::lib_on::functions::alloc::guard::{AllocMetric, ALLOC_METRIC};
 
@@ -36,37 +37,25 @@ pub(crate) fn build_functions_list_alloc(
         &bytes_cache
     };
 
-    let grand_total: u64 = if *crate::functions::EXCLUDE_WRAPPER {
-        stats
-            .values()
-            .filter(|s| !s.wrapper && s.has_data)
-            .map(|s| primary_cache.get(&s.id).copied().unwrap_or(0))
-            .sum()
-    } else if *crate::lib_on::functions::alloc::guard::ALLOC_CUMULATIVE {
-        let wrapper_total = stats
-            .values()
-            .find(|s| s.wrapper && s.has_data)
-            .map(|s| primary_cache.get(&s.id).copied().unwrap_or(0));
-
-        wrapper_total.unwrap_or_else(|| {
-            stats
-                .values()
-                .filter(|s| s.has_data)
-                .map(|s| primary_cache.get(&s.id).copied().unwrap_or(0))
-                .sum()
-        })
-    } else {
-        stats
-            .values()
-            .filter(|s| s.has_data)
-            .map(|s| primary_cache.get(&s.id).copied().unwrap_or(0))
-            .sum()
-    };
-
     let mut entries: Vec<_> = stats
         .values()
         .filter(|s| s.has_data && !(exclude_wrapper && s.wrapper))
         .collect();
+    let cumulative_total = if !exclude_wrapper && *crate::functions::alloc::guard::ALLOC_CUMULATIVE
+    {
+        completed_roots
+            .map(|(bytes, count)| if use_count { count } else { bytes })
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|s| s.wrapper)
+                    .and_then(|s| primary_cache.get(&s.id).copied())
+            })
+    } else {
+        None
+    };
+    let grand_total: u64 =
+        cumulative_total.unwrap_or_else(|| entries.iter().map(|s| primary_cache[&s.id]).sum());
 
     entries.sort_by(|a, b| {
         let a_primary = primary_cache.get(&a.id).copied().unwrap_or(0);

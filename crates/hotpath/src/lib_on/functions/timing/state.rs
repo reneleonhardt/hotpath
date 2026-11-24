@@ -17,7 +17,14 @@ fn add_measurement(m: Measurement) {
     if !MEASUREMENT_QUEUES.is_active() {
         return;
     }
-    let _ = MEASUREMENT_PRODUCER.try_with(|producer| producer.push(m));
+    let mut measurement = Some(m);
+    if MEASUREMENT_PRODUCER
+        .try_with(|producer| producer.push(measurement.take().unwrap()))
+        .is_err()
+    {
+        // A user TLS destructor can run after its usual producer was dropped.
+        MEASUREMENT_QUEUES.register().push(measurement.unwrap());
+    }
 }
 
 pub(crate) fn set_measurements_active(active: bool) {
