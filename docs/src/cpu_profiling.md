@@ -121,7 +121,7 @@ Standard CPU profilers sometimes miss top bottleneck functions because the compi
 
 By default, with `hotpath-cpu`, `#[hotpath::measure]` strips any user-provided `#[inline(...)]` attribute and injects `#[inline(never)]`. This forces the function to retain its own symbol so CPU samples attribute correctly.
 
-Enable `hotpath-cpu-inline` to preserve compiler inlining and attribute inline frames using DWARF when Hotpath builds the report. Build with debug information and keep the matching debug files with the executable. On macOS, Hotpath can read an adjacent dSYM bundle.
+Enable `hotpath-cpu-inline` to preserve compiler inlining and attribute inline frames using DWARF when Hotpath builds the report. Build with debug information and keep the matching debug files with the executable. On macOS, Hotpath can read an adjacent dSYM bundle. Hotpath reuses bounded DWARF data and address lookups across reports when the debug data comes from a single verified artifact.
 
 With `hotpath-cpu` alone, you can disable the rewrite by setting `HOTPATH_KEEP_INLINE=1`. The variable is read at proc-macro expansion time, so touch the source file or run `cargo clean` after toggling it.
 

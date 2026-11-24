@@ -1987,6 +1987,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
+ "gimli",
  "hdrhistogram",
  "hotpath-drain",
  "hotpath-macros",

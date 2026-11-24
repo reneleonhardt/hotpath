@@ -128,16 +128,24 @@ pub(crate) fn build_cpu_report_from_path(
                         };
                         let symbol = library.index.lookup(address).filter(eligible);
                         #[cfg(feature = "hotpath-cpu-inline")]
-                        let symbol = if let Some(inline) = &mut library.inline {
-                            let labels = inline.lookup(address, &match_to_display);
+                        let symbol = {
+                            let direct = library.index.direct_inline.as_ref();
+                            #[cfg(target_os = "macos")]
+                            let direct = direct
+                                .or_else(|| library.adjacent.as_ref()?.direct_inline.as_ref());
+                            let labels = library.inline.lookup(
+                                library._path,
+                                address,
+                                library.index.image_base,
+                                direct,
+                                &match_to_display,
+                            );
                             if inclusive {
                                 matched.extend(labels.iter().copied().filter(eligible));
                                 symbol
                             } else {
                                 labels.iter().copied().find(eligible).or(symbol)
                             }
-                        } else {
-                            symbol
                         };
                         if let Some(sym) = symbol {
                             if inclusive {
@@ -247,6 +255,8 @@ fn load_profile(path: &std::path::Path) -> Result<Profile, Box<dyn std::error::E
 struct LibSymbolIndex {
     #[cfg(feature = "hotpath-cpu-inline")]
     image_base: u64,
+    #[cfg(feature = "hotpath-cpu-inline")]
+    direct_inline: Option<Mutex<DirectInlineSymbols>>,
     ranges: Vec<(u64, u64, &'static str)>,
     code_id: Option<Box<[u8]>>,
 }
@@ -364,36 +374,66 @@ impl SymbolCache {
     }
 }
 
+static SYMBOL_CACHE: std::sync::LazyLock<SymbolCache> =
+    std::sync::LazyLock::new(SymbolCache::default);
+
 #[cfg_attr(feature = "hotpath-meta", hotpath_meta::measure)]
 fn build_lib_index<'a>(
     lib: &'a Lib,
     match_to_display: &HashMap<&'static str, &'static str>,
 ) -> Option<(&'a str, Arc<LibSymbolIndex>)> {
-    static CACHE: std::sync::LazyLock<SymbolCache> = std::sync::LazyLock::new(SymbolCache::default);
-
     let debug_path = lib.debug_path.as_deref().filter(|p| !p.is_empty());
     let binary_path = lib.path.as_deref().filter(|&path| Some(path) != debug_path);
     debug_path.into_iter().chain(binary_path).find_map(|path| {
-        let index = CACHE.index(Path::new(path), match_to_display, lib.code_id.as_deref())?;
+        let index =
+            SYMBOL_CACHE.index(Path::new(path), match_to_display, lib.code_id.as_deref())?;
         Some((path, index))
     })
 }
 
-struct ReportLibrary {
+struct ReportLibrary<'a> {
+    _path: &'a str,
     index: Arc<LibSymbolIndex>,
     #[cfg(feature = "hotpath-cpu-inline")]
-    inline: Option<InlineSymbols>,
+    inline: InlineSymbols,
+    #[cfg(all(feature = "hotpath-cpu-inline", target_os = "macos"))]
+    adjacent: Option<Arc<LibSymbolIndex>>,
 }
 
-impl ReportLibrary {
-    fn load(lib: &Lib, labels: &HashMap<&'static str, &'static str>) -> Option<Self> {
-        let (_path, index) = build_lib_index(lib, labels)?;
+impl<'a> ReportLibrary<'a> {
+    fn load(lib: &'a Lib, labels: &HashMap<&'static str, &'static str>) -> Option<Self> {
+        let (path, index) = build_lib_index(lib, labels)?;
         Some(Self {
+            #[cfg(all(feature = "hotpath-cpu-inline", target_os = "macos"))]
+            adjacent: if index.direct_inline.is_none() && lib.path.as_deref() == Some(path) {
+                adjacent_dsym(path, lib.code_id.as_deref(), labels)
+            } else {
+                None
+            },
+            _path: path,
             #[cfg(feature = "hotpath-cpu-inline")]
-            inline: InlineSymbols::new(_path, index.image_base),
+            inline: InlineSymbols::default(),
             index,
         })
     }
+}
+
+#[cfg(all(feature = "hotpath-cpu-inline", target_os = "macos"))]
+fn adjacent_dsym(
+    path: &str,
+    code_id: Option<&str>,
+    labels: &HashMap<&'static str, &'static str>,
+) -> Option<Arc<LibSymbolIndex>> {
+    let code_id = code_id.filter(|id| !id.is_empty())?;
+    let name = Path::new(path).file_name()?;
+    let mut bundle = std::ffi::OsString::from(path);
+    bundle.push(".dSYM");
+    let source = std::path::PathBuf::from(bundle)
+        .join("Contents/Resources/DWARF")
+        .join(name);
+    SYMBOL_CACHE
+        .index(&source, labels, Some(code_id))
+        .filter(|index| index.code_id.is_some() && index.direct_inline.is_some())
 }
 
 fn build_symbol_index(
@@ -460,27 +500,58 @@ fn build_symbol_index(
     Some(LibSymbolIndex {
         #[cfg(feature = "hotpath-cpu-inline")]
         image_base: base,
+        #[cfg(feature = "hotpath-cpu-inline")]
+        direct_inline: DirectInlineSymbols::new(parsed).map(Mutex::new),
         ranges,
         code_id,
     })
 }
 
 #[cfg(feature = "hotpath-cpu-inline")]
-struct InlineSymbols {
-    loader: addr2line::Loader,
-    base: u64,
-    by_address: HashMap<u64, Box<[&'static str]>>,
-    demangled: String,
+type InlineLabels = Option<Arc<[&'static str]>>;
+
+#[cfg(feature = "hotpath-cpu-inline")]
+struct DirectInlineSymbols {
+    context: addr2line::Context<gimli::EndianArcSlice<gimli::RunTimeEndian>>,
+    by_address: HashMap<u64, InlineLabels>,
 }
 
 #[cfg(feature = "hotpath-cpu-inline")]
-impl InlineSymbols {
-    fn new(path: &str, base: u64) -> Option<Self> {
+impl DirectInlineSymbols {
+    fn new(file: &object::File<'_>) -> Option<Self> {
+        use object::{read::macho::MachHeader, ObjectSection};
+
+        // Mach-O executables may resolve through a dSYM or external object files.
+        match file {
+            object::File::Elf32(_) | object::File::Elf64(_) => {}
+            object::File::MachO64(file)
+                if file.macho_header().filetype(file.endian()) == object::macho::MH_DSYM => {}
+            _ => return None,
+        }
+        file.section_by_name(".debug_info")?;
+        let endian = if file.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
+        let mut remaining = 4 * 1024 * 1024_u64;
+        let mut dwarf = gimli::Dwarf::load(|id| {
+            let Some(section) = file.section_by_name(id.name()) else {
+                return Ok(gimli::EndianArcSlice::new(Arc::from([]), endian));
+            };
+            let data = section.compressed_data().map_err(|_| ())?;
+            remaining = remaining.checked_sub(data.uncompressed_size).ok_or(())?;
+            let bytes = data.decompress().map_err(|_| ())?;
+            Ok::<_, ()>(gimli::EndianArcSlice::new(
+                Arc::from(bytes.as_ref()),
+                endian,
+            ))
+        })
+        .ok()?;
+        dwarf.populate_abbreviations_cache(gimli::AbbreviationsCacheStrategy::Duplicates);
         Some(Self {
-            loader: addr2line::Loader::new(path).ok()?,
-            base,
+            context: addr2line::Context::from_dwarf(dwarf).ok()?,
             by_address: HashMap::new(),
-            demangled: String::new(),
         })
     }
 
@@ -488,34 +559,91 @@ impl InlineSymbols {
         &mut self,
         address: u64,
         labels: &HashMap<&'static str, &'static str>,
-    ) -> &[&'static str] {
-        self.by_address.entry(address).or_insert_with(|| {
-            let mut found = Vec::new();
-            if let Some(mut frames) = self
-                .base
-                .checked_add(address)
-                .and_then(|address| self.loader.find_frames(address).ok())
-            {
-                while let Ok(Some(frame)) = frames.next() {
-                    let Some(raw) = frame
-                        .function
-                        .as_ref()
-                        .and_then(|name| name.raw_name().ok())
-                    else {
-                        continue;
-                    };
-                    self.demangled.clear();
-                    write!(self.demangled, "{:#}", rustc_demangle::demangle(&raw)).unwrap();
-                    let normalized =
-                        strip_inherent_impl_brackets(strip_hash_suffix(&self.demangled));
-                    if let Some(label) = match_eligible_symbol(&normalized, labels) {
-                        found.push(label);
-                    }
-                }
-            }
-            found.into_boxed_slice()
-        })
+        demangled: &mut String,
+    ) -> Option<InlineLabels> {
+        if let Some(names) = self.by_address.get(&address) {
+            return Some(names.clone());
+        }
+        // The fallback loader resolves DWO/DWP references without caching them across reports.
+        let addr2line::LookupResult::Output(frames) = self.context.find_frames(address) else {
+            return None;
+        };
+        let names = collect_inline_labels(frames.ok()?, labels, demangled).ok()?;
+        const MAX_INLINE_ADDRESSES: usize = 4096;
+        if self.by_address.len() < MAX_INLINE_ADDRESSES {
+            self.by_address.insert(address, names.clone());
+        }
+        Some(names)
     }
+}
+
+#[cfg(feature = "hotpath-cpu-inline")]
+#[derive(Default)]
+struct InlineSymbols {
+    fallback: Option<Option<addr2line::Loader>>,
+    by_address: HashMap<u64, InlineLabels>,
+    demangled: String,
+}
+
+#[cfg(feature = "hotpath-cpu-inline")]
+impl InlineSymbols {
+    fn lookup(
+        &mut self,
+        path: &str,
+        address: u64,
+        base: u64,
+        direct: Option<&Mutex<DirectInlineSymbols>>,
+        labels: &HashMap<&'static str, &'static str>,
+    ) -> &[&'static str] {
+        self.by_address
+            .entry(address)
+            .or_insert_with(|| {
+                let address = base.checked_add(address)?;
+                if let Some(names) = direct.and_then(|direct| {
+                    direct
+                        .try_lock()
+                        .ok()?
+                        .lookup(address, labels, &mut self.demangled)
+                }) {
+                    return names;
+                }
+                let loader = self
+                    .fallback
+                    .get_or_insert_with(|| addr2line::Loader::new(path).ok())
+                    .as_ref()?;
+                let frames = loader.find_frames(address).ok()?;
+                collect_inline_labels(frames, labels, &mut self.demangled)
+                    .ok()
+                    .flatten()
+            })
+            .as_deref()
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(feature = "hotpath-cpu-inline")]
+fn collect_inline_labels<R: gimli::Reader>(
+    mut frames: addr2line::FrameIter<'_, R>,
+    labels: &HashMap<&'static str, &'static str>,
+    demangled: &mut String,
+) -> Result<InlineLabels, gimli::Error> {
+    let mut found = Vec::new();
+    while let Some(frame) = frames.next()? {
+        let Some(raw) = frame
+            .function
+            .as_ref()
+            .and_then(|name| name.raw_name().ok())
+        else {
+            continue;
+        };
+        demangled.clear();
+        write!(demangled, "{:#}", rustc_demangle::demangle(&raw)).unwrap();
+        let normalized = strip_inherent_impl_brackets(strip_hash_suffix(demangled));
+        if let Some(label) = match_eligible_symbol(&normalized, labels) {
+            found.push(label);
+        }
+    }
+    Ok((!found.is_empty()).then(|| Arc::from(found)))
 }
 
 fn pick_image_base<'a>(file: &object::File<'a, &'a [u8]>) -> u64 {
