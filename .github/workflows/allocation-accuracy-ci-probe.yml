@@ -31,6 +31,20 @@ jobs:
           cargo test --locked -p hotpath --lib --features hotpath-alloc,hotpath-cpu-inline,hotpath-prometheus,hotpath-ordered-drain
           cargo test --locked -p hotpath --features hotpath --test functions_alloc final_totals_include_workers_and_cleanup -- --test-threads=1
           cargo test --locked -p hotpath --features hotpath-prometheus --test prometheus_native -- --test-threads=1
+      - name: Verify allocator and async guard ownership
+        run: |
+          test "$(uname -m)" = x86_64
+          features=hotpath-alloc,hotpath-cpu-inline,hotpath-prometheus,hotpath-ordered-drain
+          for test in \
+            lib_on::functions::allocator::tests::counts_only_successful_allocations \
+            lib_on::functions::alloc::guard::tests::measured_block_releases_allocations_between_polls \
+            lib_on::functions::alloc::guard::tests::async_block_tracks_macro_hidden_polls \
+            lib_on::futures::wrapper::tests::filtered_and_unwinding_polls_restore_the_allocation_stack \
+            lib_on::functions::tests::async_block_starts_measurement_on_first_poll
+          do
+            cargo test --locked -p hotpath --lib --features "$features" "$test" -- --list | grep -Fx "$test: test"
+            cargo test --locked -p hotpath --lib --features "$features" "$test" -- --exact
+          done
       - name: Verify exact inclusive CPU replay
         env:
           HOTPATH_CPU_INCLUSIVE: "1"

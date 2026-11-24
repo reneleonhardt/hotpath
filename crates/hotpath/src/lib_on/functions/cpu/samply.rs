@@ -43,6 +43,15 @@ pub(crate) fn build_cpu_report_from_path(
         return None;
     }
 
+    build_cpu_report(caller_name, path, &profile, &display_to_id)
+}
+
+fn build_cpu_report(
+    caller_name: &'static str,
+    path: &Path,
+    profile: &Profile,
+    display_to_id: &HashMap<&'static str, u32>,
+) -> Option<CpuReport> {
     let label_to_symbol = crate::lib_on::functions::get_cpu_label_aliases();
     let mut match_to_display: HashMap<&'static str, &'static str> =
         HashMap::with_capacity(display_to_id.len());

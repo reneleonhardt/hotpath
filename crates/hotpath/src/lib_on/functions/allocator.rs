@@ -130,10 +130,17 @@ mod tests {
                 };
                 assert_eq!(ptr.is_null(), size != 8);
                 if !ptr.is_null() {
+                    if zeroed {
+                        assert_eq!(ptr.read(), 0);
+                    }
+                    ptr.write(0xa5);
                     assert!(alloc.realloc(ptr, layout, 32).is_null());
-                    let ptr = alloc.realloc(ptr, layout, 8);
-                    assert!(!ptr.is_null());
-                    alloc.dealloc(ptr, layout);
+                    assert_eq!(ptr.read(), 0xa5);
+
+                    let new_ptr = alloc.realloc(ptr, layout, 8);
+                    assert!(!new_ptr.is_null());
+                    assert_eq!(new_ptr.read(), 0xa5);
+                    alloc.dealloc(new_ptr, layout);
                 }
             }
         }

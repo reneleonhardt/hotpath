@@ -7,8 +7,8 @@ use std::sync::LazyLock;
 
 use object::{Object, ObjectSymbol};
 
-use crate::functions::cpu::samply::pick_image_base;
-use crate::functions::cpu::{build_cpu_report_from_path, CPU_INCLUSIVE};
+use crate::functions::cpu::samply::{build_cpu_report, load_profile, pick_image_base};
+use crate::functions::cpu::CPU_INCLUSIVE;
 use crate::json::CpuSampleUnit;
 
 static RUSTC: LazyLock<OsString> =
@@ -137,7 +137,8 @@ pub extern "C" fn replay_call(value: u64) -> u64 {
     };
     for _ in 0..2 {
         let names = HashMap::from([(ENTRY, 1), (LEAF, 2)]);
-        let report = build_cpu_report_from_path("replay", &path, Some(names)).unwrap();
+        let profile = load_profile(&path).unwrap();
+        let report = build_cpu_report("replay", &path, &profile, &names).unwrap();
         assert_eq!(report.sample_unit, CpuSampleUnit::Microseconds);
         assert_eq!((report.total_samples, report.attributed_samples), (11, 11));
         let rows: Vec<_> = report
