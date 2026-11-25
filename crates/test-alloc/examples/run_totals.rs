@@ -20,9 +20,7 @@ fn work(size: usize) {
 
 #[hotpath::measure]
 fn worker() {
-    CLEANUP.with(|value| {
-        black_box(value);
-    });
+    CLEANUP.with(|_| ());
     work(8);
 }
 

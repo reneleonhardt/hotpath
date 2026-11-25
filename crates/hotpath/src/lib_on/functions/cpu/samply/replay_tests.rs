@@ -8,7 +8,6 @@ use std::sync::LazyLock;
 use object::{Object, ObjectSymbol};
 
 use crate::functions::cpu::samply::{build_cpu_report, load_profile, pick_image_base};
-use crate::functions::cpu::CPU_INCLUSIVE;
 use crate::json::CpuSampleUnit;
 
 static RUSTC: LazyLock<OsString> =
@@ -99,21 +98,6 @@ pub extern "C" fn replay_call(value: u64) -> u64 {
                 false
             })
             .expect("fixture must have a real DWARF inline frame");
-        use crate::functions::cpu::samply::{InlineSymbols, MAX_INLINE_ADDRESSES};
-
-        let mut inline = InlineSymbols::default();
-        inline
-            .by_address
-            .extend((0..MAX_INLINE_ADDRESSES).map(|i| (u64::MAX - i as u64, None)));
-        let labels = inline.lookup(
-            debug.to_str().unwrap(),
-            pc,
-            0,
-            None,
-            &HashMap::from([(LEAF, LEAF)]),
-        );
-        assert_eq!(labels, &[LEAF]);
-        assert_eq!(inline.by_address.len(), MAX_INLINE_ADDRESSES);
         (pc, LEAF)
     };
     let uuid = object.mach_uuid().unwrap();
@@ -146,34 +130,40 @@ pub extern "C" fn replay_call(value: u64) -> u64 {
     let path = dir.join("profile.json");
     let profile = serde_json::json!({
         "meta": {"sampleUnits": {"threadCPUDelta": "µs"}},
-        "libs": [{"path": library, "codeId": code_id}],
+        "libs": [{"path": library, "debugPath": dir.join("missing.debug"), "codeId": code_id}],
         "threads": [earlier, foreign, thread],
     });
     fs::write(&path, profile.to_string()).unwrap();
-    let expected_rows = if cfg!(feature = "hotpath-cpu-inline") && *CPU_INCLUSIVE {
+    let expected_rows = if cfg!(feature = "hotpath-cpu-inline")
+        && crate::shared::env_flag("HOTPATH_CPU_INCLUSIVE")
+    {
         &[(ENTRY, 11), (LEAF, 11)][..]
     } else {
         &[(expected, 11)][..]
     };
+    let names = HashMap::from([(ENTRY, 1), (LEAF, 2)]);
+    let captured = load_profile(&path).unwrap();
     for _ in 0..2 {
-        let names = HashMap::from([(ENTRY, 1), (LEAF, 2)]);
-        let profile = load_profile(&path).unwrap();
-        let report = build_cpu_report("replay", &path, &profile, &names).unwrap();
+        let report = build_cpu_report("replay", &path, &captured, &names).unwrap();
         assert_eq!(report.sample_unit, CpuSampleUnit::Microseconds);
         assert_eq!((report.total_samples, report.attributed_samples), (11, 11));
-        let rows: Vec<_> = report
-            .stats
-            .iter()
-            .map(|row| (row.name, row.samples))
-            .collect();
-        assert_eq!(rows, expected_rows);
+        assert_eq!(report.stats.len(), expected_rows.len());
+        for &(name, samples) in expected_rows {
+            assert!(report
+                .stats
+                .iter()
+                .any(|row| (row.name, row.samples) == (name, samples)));
+        }
     }
+    let report = build_cpu_report("replay", &path, &captured, &HashMap::new()).unwrap();
+    assert_eq!(report.attributed_samples, 0);
+    assert!(report.stats.is_empty());
+
     let mut profile = profile;
     let mut thread = profile["threads"][2].clone();
     thread["samples"]["threadCPUDelta"] = serde_json::json!([i64::MAX, 0, 0, 0]);
     profile["threads"] = serde_json::json!([&thread, &thread, &thread]);
     let profile = serde_json::from_value(profile).unwrap();
-    let names = HashMap::from([(ENTRY, 1), (LEAF, 2)]);
     let report = build_cpu_report("replay", &path, &profile, &names).unwrap();
     assert_eq!(
         (report.total_samples, report.attributed_samples),

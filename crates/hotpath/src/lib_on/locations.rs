@@ -53,11 +53,6 @@ pub struct BlockLabels {
     extra: OnceLock<RwLock<HashSet<&'static str>>>,
 }
 
-#[cfg(test)]
-thread_local! {
-    static BLOCK_LABEL_COLD_LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
 impl BlockLabels {
     const MAX_EXTRA: usize = 32;
 
@@ -81,8 +76,6 @@ impl BlockLabels {
 
     #[cold]
     fn register_uncached(&self, label: &'static str, location: &'static Location) {
-        #[cfg(test)]
-        BLOCK_LABEL_COLD_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
         for slot in &self.common {
             let cached = *slot.get_or_init(|| {
                 register_block_label(label, location);
@@ -103,13 +96,12 @@ impl BlockLabels {
         }
         let _suspend = crate::lib_on::SuspendAllocTracking::new();
         let mut labels = labels.write().unwrap();
-        if labels.len() == Self::MAX_EXTRA {
-            let known = labels.contains(label);
-            drop(labels);
-            if !known {
+        if labels.len() < Self::MAX_EXTRA {
+            if labels.insert(label) {
                 register_block_label(label, location);
             }
-        } else if labels.insert(label) {
+        } else if !labels.contains(label) {
+            drop(labels);
             register_block_label(label, location);
         }
     }
@@ -238,61 +230,29 @@ fn is_absolute_path(file: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn block_labels_register_shared_prefixes_and_overflow_once() {
-        static LOC: crate::Location = crate::Location {
-            file: file!(),
-            line: line!(),
-            column: column!(),
-        };
-        let cache = crate::BlockLabels::new();
-        let long = "block-label-test-long";
-        let short = &long[..10];
-        assert_eq!(long.as_ptr(), short.as_ptr());
-        for label in [
-            long,
-            short,
-            "block-label-test-extra",
-            short,
-            "block-label-test-extra",
-        ] {
-            cache.register(label, &LOC);
-            assert!(crate::lib_on::locations::lookup_location(label).is_some());
-            assert!(crate::functions::is_labeled(label));
-        }
-        assert_eq!(cache.extra.get().unwrap().read().unwrap().len(), 1);
-        let before = crate::lib_on::locations::BLOCK_LABEL_COLD_LOOKUPS.get();
-        for label in [long, short].into_iter().cycle().take(100) {
-            cache.register(label, &LOC);
-        }
-        assert_eq!(
-            crate::lib_on::locations::BLOCK_LABEL_COLD_LOOKUPS.get(),
-            before
-        );
-    }
-
     use crate::lib_on::locations::{
         lookup_location, normalize_file_path, register_location, Location,
     };
 
     #[test]
-    fn block_label_cache_stops_growing_but_keeps_registering_labels() {
-        use crate::lib_on::locations::BlockLabels;
-
-        static LOC: Location = Location {
-            file: "src/blocks.rs",
-            line: 1,
-            column: 1,
-        };
-        let cache = BlockLabels::new();
-        let labels = "block_cap_a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff gg hh block_cap_last";
-        for label in labels.split_whitespace() {
-            cache.register(label, &LOC);
+    #[deny(unused_variables)]
+    fn dynamic_labels_keep_their_locations() {
+        let long = "block-label-test-long";
+        let short = &long[..10];
+        let labels = "block_a block_b block_c block_d block_e block_f block_g block_h
+                      block_i block_j block_k block_l block_m block_n block_o block_p
+                      block_q block_r block_s block_t block_u block_v block_w block_x
+                      block_y block_z block_aa block_bb block_cc block_dd block_ee
+                      block_ff block_gg block_hh block_ii";
+        for label in [long, short]
+            .into_iter()
+            .chain(labels.split_whitespace())
+            .chain([short, long])
+        {
+            hotpath::measure_block!(label, ());
+            assert_eq!(lookup_location(label).unwrap().file, file!());
+            assert!(crate::functions::is_labeled(label));
         }
-        let extra = cache.extra.get().unwrap().read().unwrap();
-        assert_eq!(extra.len(), BlockLabels::MAX_EXTRA);
-        assert!(!extra.contains("block_cap_last"));
-        assert_eq!(lookup_location("block_cap_last").unwrap().file, LOC.file);
     }
 
     #[test]

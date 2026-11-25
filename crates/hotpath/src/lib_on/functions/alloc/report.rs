@@ -19,60 +19,43 @@ pub(crate) fn build_functions_list_alloc(
     let use_count = *ALLOC_METRIC == AllocMetric::Count;
     let precision = Precision::for_cloud(config.cloud);
 
-    let bytes_cache: HashMap<u32, u64> = stats
-        .iter()
-        .filter(|(_, s)| s.has_data)
-        .map(|(&id, s)| (id, s.total_bytes()))
-        .collect();
-
-    let count_cache: HashMap<u32, u64> = stats
-        .iter()
-        .filter(|(_, s)| s.has_data)
-        .map(|(&id, s)| (id, s.total_count()))
-        .collect();
-
-    let primary_cache = if use_count {
-        &count_cache
-    } else {
-        &bytes_cache
-    };
-
+    let primary = |bytes, count| if use_count { count } else { bytes };
     let mut entries: Vec<_> = stats
         .values()
         .filter(|s| s.has_data && !(exclude_wrapper && s.wrapper))
+        .map(|s| (s, s.total_bytes(), s.total_count()))
         .collect();
-    let cumulative_total = if !exclude_wrapper && *crate::functions::alloc::guard::ALLOC_CUMULATIVE
-    {
-        completed_roots
-            .map(|(bytes, count)| if use_count { count } else { bytes })
-            .or_else(|| {
-                entries
-                    .iter()
-                    .find(|s| s.wrapper)
-                    .and_then(|s| primary_cache.get(&s.id).copied())
-            })
+    let roots = if !exclude_wrapper && *crate::functions::alloc::guard::ALLOC_CUMULATIVE {
+        completed_roots.or_else(|| {
+            entries
+                .iter()
+                .find(|(s, ..)| s.wrapper)
+                .map(|&(_, bytes, count)| (bytes, count))
+        })
     } else {
         None
     };
-    let grand_total: u64 =
-        cumulative_total.unwrap_or_else(|| entries.iter().map(|s| primary_cache[&s.id]).sum());
+    let grand_total: u64 = roots.map_or_else(
+        || {
+            entries
+                .iter()
+                .map(|&(_, bytes, count)| primary(bytes, count))
+                .sum()
+        },
+        |(bytes, count)| primary(bytes, count),
+    );
 
-    entries.sort_by(|a, b| {
-        let a_primary = primary_cache.get(&a.id).copied().unwrap_or(0);
-        let b_primary = primary_cache.get(&b.id).copied().unwrap_or(0);
-        b_primary.cmp(&a_primary).then_with(|| a.name.cmp(b.name))
+    entries.sort_by(|&(a, a_bytes, a_count), &(b, b_bytes, b_count)| {
+        primary(b_bytes, b_count)
+            .cmp(&primary(a_bytes, a_count))
+            .then_with(|| a.name.cmp(b.name))
     });
 
     let total_count = entries.len();
-    let included_count = if config.limit > 0 && config.limit < total_count {
-        config.limit
-    } else {
-        total_count
-    };
-
     if config.limit > 0 {
         entries.truncate(config.limit);
     }
+    let included_count = entries.len();
 
     let format_alloc_value = |bytes: u64, count: u64| -> String {
         if use_count {
@@ -89,10 +72,8 @@ pub(crate) fn build_functions_list_alloc(
 
     let data: Vec<JsonFunctionEntry> = entries
         .into_iter()
-        .map(|s| {
-            let entry_bytes = bytes_cache.get(&s.id).copied().unwrap_or(0);
-            let entry_count = count_cache.get(&s.id).copied().unwrap_or(0);
-            let primary_total = if use_count { entry_count } else { entry_bytes };
+        .map(|(s, entry_bytes, entry_count)| {
+            let primary_total = primary(entry_bytes, entry_count);
 
             let percentage = if grand_total > 0 {
                 (primary_total as f64 / grand_total as f64) * 100.0

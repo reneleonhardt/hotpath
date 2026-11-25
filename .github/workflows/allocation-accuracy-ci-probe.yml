@@ -37,21 +37,26 @@ jobs:
           features=hotpath-alloc,hotpath-cpu-inline,hotpath-prometheus,hotpath-ordered-drain
           for test in \
             lib_on::functions::allocator::tests::counts_only_successful_allocations \
-            lib_on::functions::alloc::guard::tests::measured_block_releases_allocations_between_polls \
-            lib_on::functions::alloc::guard::tests::async_block_tracks_macro_hidden_polls \
-            lib_on::functions::alloc::guard::tests::measured_await_releases_borrowed_frames_on_unwind \
-            lib_on::futures::wrapper::tests::filtered_and_unwinding_polls_restore_the_allocation_stack \
-            lib_on::functions::tests::async_block_starts_measurement_on_first_poll
+            lib_on::functions::alloc::guard::tests::async_blocks_report_only_their_polled_allocations
           do
             nice -n 10 cargo test --locked -p hotpath --lib --features "$features" "$test" -- --list | grep -Fx "$test: test"
             nice -n 10 cargo test --locked -p hotpath --lib --features "$features" "$test" -- --exact
           done
-      - name: Verify cache limits and CPU overflow on x86-64
+      - name: Verify cumulative allocation counts
+        env:
+          HOTPATH_ALLOC_CUMULATIVE: "1"
+          HOTPATH_ALLOC_METRIC: count
+        run: |
+          test=lib_on::functions::alloc::guard::tests::async_blocks_report_only_their_polled_allocations
+          features=hotpath-alloc,hotpath-cpu-inline,hotpath-prometheus,hotpath-ordered-drain
+          nice -n 10 cargo test --locked -p hotpath --lib --features "$features" "$test" -- --list | grep -Fx "$test: test"
+          nice -n 10 cargo test --locked -p hotpath --lib --features "$features" "$test" -- --exact
+      - name: Verify label registration and CPU overflow on x86-64
         run: |
           test "$(uname -m)" = x86_64
           features=hotpath-alloc,hotpath-cpu-inline,hotpath-prometheus,hotpath-ordered-drain
           for test in \
-            lib_on::locations::tests::block_label_cache_stops_growing_but_keeps_registering_labels \
+            lib_on::locations::tests::dynamic_labels_keep_their_locations \
             lib_on::functions::cpu::samply::tests::caps_weight_totals_without_wrapping \
             lib_on::functions::cpu::samply::replay_tests::replays_shared_library_attribution
           do

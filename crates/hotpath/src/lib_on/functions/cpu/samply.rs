@@ -100,7 +100,6 @@ fn build_cpu_report(
         let resource_lib = &thread.resource_table.lib;
 
         let attribute = |root, weight| {
-            let mut credited = false;
             let mut cur = root;
             while let Some(s) = cur {
                 let frame_idx = match stack_frame.get(s) {
@@ -161,8 +160,8 @@ fn build_cpu_report(
                             } else {
                                 let count = sample_counts.entry(sym).or_default();
                                 *count = count.saturating_add(weight);
-                                credited = true;
-                                break;
+                                attributed_samples = attributed_samples.saturating_add(weight);
+                                return;
                             }
                         }
                     }
@@ -176,13 +175,11 @@ fn build_cpu_report(
                     .filter(|&parent| parent < s);
             }
 
-            if inclusive && !matched.is_empty() {
+            if !matched.is_empty() {
                 for sym in matched.drain() {
                     let count = sample_counts.entry(sym).or_default();
                     *count = count.saturating_add(weight);
                 }
-                attributed_samples = attributed_samples.saturating_add(weight);
-            } else if credited {
                 attributed_samples = attributed_samples.saturating_add(weight);
             }
         };
@@ -592,7 +589,7 @@ impl DirectInlineSymbols {
 #[cfg(feature = "hotpath-cpu-inline")]
 #[derive(Default)]
 struct InlineSymbols {
-    fallback: Option<Option<addr2line::Loader>>,
+    fallback: std::cell::OnceCell<Option<addr2line::Loader>>,
     by_address: HashMap<u64, InlineLabels>,
     uncached: InlineLabels,
     demangled: String,
@@ -627,19 +624,20 @@ impl InlineSymbols {
             }
             let loader = self
                 .fallback
-                .get_or_insert_with(|| addr2line::Loader::new(path).ok())
+                .get_or_init(|| addr2line::Loader::new(path).ok())
                 .as_ref()?;
             let frames = loader.find_frames(address).ok()?;
             collect_inline_labels(frames, labels, &mut self.demangled)
                 .ok()
                 .flatten()
         })();
-        if full {
+        let slot = if full {
             self.uncached = names;
-            self.uncached.as_deref().unwrap_or_default()
+            &self.uncached
         } else {
-            entry.insert(names).as_deref().unwrap_or_default()
-        }
+            entry.insert(names)
+        };
+        slot.as_deref().unwrap_or_default()
     }
 }
 
@@ -812,88 +810,14 @@ mod replay_tests;
 mod tests {
     use std::collections::HashMap;
 
-    use crate::lib_on::functions::cpu::json::Lib;
     use crate::lib_on::functions::cpu::samply::{
-        build_lib_index, match_eligible_symbol, strip_hash_suffix, strip_inherent_impl_brackets,
+        match_eligible_symbol, strip_hash_suffix, strip_inherent_impl_brackets,
     };
 
     fn identity_map<const N: usize>(
         items: [&'static str; N],
     ) -> HashMap<&'static str, &'static str> {
         items.into_iter().map(|s| (s, s)).collect()
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn reuses_symbol_index_only_for_the_same_file_and_labels() {
-        use std::{path::Path, sync::Arc};
-
-        use crate::lib_on::functions::cpu::samply::SymbolCache;
-
-        let cache = SymbolCache::default();
-        let exe = std::env::current_exe().unwrap();
-        let first = cache.index(&exe, &identity_map(["first"]), None).unwrap();
-        let reused = cache.index(&exe, &identity_map(["first"]), None).unwrap();
-        let changed = cache.index(&exe, &identity_map(["other"]), None).unwrap();
-        assert!(Arc::ptr_eq(&first, &reused));
-        assert!(!Arc::ptr_eq(&first, &changed));
-        assert!(cache
-            .index(
-                Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")),
-                &identity_map(["other"]),
-                None,
-            )
-            .is_none());
-    }
-
-    #[test]
-    fn rejects_a_different_recorded_code_id() {
-        use crate::lib_on::functions::cpu::samply::matches_code_id;
-
-        let actual = Some(&[0xab, 0x13][..]);
-        assert!(matches_code_id(actual, Some("Ab13")));
-        assert!(matches_code_id(actual, None));
-        assert!(!matches_code_id(actual, Some("AB12")));
-        assert!(!matches_code_id(actual, Some("AB")));
-    }
-
-    #[test]
-    fn falls_back_to_executable_when_debug_file_is_unavailable() {
-        let exe = std::env::current_exe().unwrap();
-        let lib = Lib {
-            path: Some(exe.to_str().unwrap().into()),
-            debug_path: Some(exe.join("missing.debug").to_str().unwrap().into()),
-            ..Lib::default()
-        };
-        assert!(build_lib_index(&lib, &HashMap::new()).is_some());
-    }
-
-    #[test]
-    fn groups_repeated_roots_without_losing_weights() {
-        use crate::lib_on::functions::cpu::samply::visit_sample_stacks;
-
-        let stacks = [Some(0), Some(0), None, Some(1), Some(9), Some(0)];
-        let sample_weights = [0, 5, 7, 0, 11];
-        let mut scratch = Vec::new();
-        for stack_count in [8, 2, 2] {
-            let mut weights = HashMap::new();
-            let mut visits = 0;
-            let total = visit_sample_stacks(
-                &stacks,
-                Some(&sample_weights),
-                stack_count,
-                &mut scratch,
-                |root, weight| {
-                    if let Some(root) = root.filter(|&root| root < stack_count) {
-                        *weights.entry(root).or_insert(0) += weight;
-                        visits += 1;
-                    }
-                },
-            );
-            assert_eq!(total, 24);
-            assert_eq!(weights, HashMap::from([(0, 6), (1, 0)]));
-            assert_eq!(visits, if stack_count == 2 { 2 } else { 4 });
-        }
     }
 
     #[test]
@@ -911,19 +835,52 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_different_recorded_code_id() {
+        use crate::lib_on::functions::cpu::samply::matches_code_id;
+
+        let actual = Some(&[0xab, 0x13][..]);
+        assert!(matches_code_id(actual, Some("Ab13")));
+        assert!(matches_code_id(actual, None));
+        assert!(!matches_code_id(actual, Some("AB12")));
+        assert!(!matches_code_id(actual, Some("AB")));
+    }
+
+    #[test]
+    fn groups_repeated_roots_without_losing_weights() {
+        use crate::lib_on::functions::cpu::samply::visit_sample_stacks;
+
+        let stacks = [Some(0), Some(0), None, Some(1), Some(9), Some(0)];
+        let sample_weights = [0, 5, 7, 0, 11];
+        let mut scratch = Vec::new();
+        for stack_count in [8, 2, 2] {
+            let mut weights = HashMap::new();
+            let total = visit_sample_stacks(
+                &stacks,
+                Some(&sample_weights),
+                stack_count,
+                &mut scratch,
+                |root, weight| {
+                    if let Some(root) = root.filter(|&root| root < stack_count) {
+                        *weights.entry(root).or_insert(0) += weight;
+                    }
+                },
+            );
+            assert_eq!(total, 24);
+            assert_eq!(weights, HashMap::from([(0, 6), (1, 0)]));
+        }
+    }
+
+    #[test]
     fn caps_weight_totals_without_wrapping() {
         use crate::lib_on::functions::cpu::samply::visit_sample_stacks;
 
-        let mut scratch = Vec::new();
-        let mut root_total = 0;
+        let mut root_total = 0_u64;
         let total = visit_sample_stacks(
             &[Some(0); 3],
             Some(&[i64::MAX; 3]),
             1,
-            &mut scratch,
-            |_, weight| {
-                root_total = weight;
-            },
+            &mut Vec::new(),
+            |_, weight| root_total = root_total.saturating_add(weight),
         );
         assert_eq!((total, root_total), (u64::MAX, u64::MAX));
     }

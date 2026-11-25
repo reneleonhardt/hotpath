@@ -260,10 +260,10 @@ pub use hotpath_macros::__hotpath_block_awaits;
 macro_rules! __hotpath_measure_block {
     ([$($parent:ident),*], $label:expr, $expr:expr) => {{
         #[allow(unused_mut)]
-        let mut guard = $crate::functions::build_measurement_guard_block($label, false);
+        let mut _guard = $crate::functions::build_measurement_guard_block($label, false);
         #[allow(unused_imports)]
         use $crate::functions::measure_block_await as __hotpath_wrap_await;
-        $crate::__hotpath_block_awaits!([$($parent,)* guard], __hotpath_wrap_await, $expr)
+        $crate::__hotpath_block_awaits!([$($parent,)* _guard], __hotpath_wrap_await, $expr)
     }};
 }
 

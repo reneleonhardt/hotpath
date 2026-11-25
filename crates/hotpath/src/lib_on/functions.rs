@@ -214,7 +214,9 @@ enum BlockMeasurement {
         bridge: Option<std::sync::Arc<AsyncAllocBridge>>,
         skipped: bool,
     },
-    Active(MeasurementGuardAsync),
+    Active {
+        _guard: MeasurementGuardAsync,
+    },
 }
 
 #[doc(hidden)]
@@ -236,15 +238,11 @@ impl<T> AsyncGuardFinish<T> for AsyncBlockGuard {
                 let _ = bridge;
                 MeasurementGuardAsync::new(name, false, *skipped)
             };
-            self.0 = BlockMeasurement::Active(guard);
+            self.0 = BlockMeasurement::Active { _guard: guard };
         }
     }
 
-    fn finish(self, _output: &T) {
-        if let BlockMeasurement::Active(guard) = self.0 {
-            drop(guard);
-        }
-    }
+    fn finish(self, _output: &T) {}
 }
 
 #[doc(hidden)]
@@ -783,28 +781,6 @@ pub(crate) fn estimated_duration_total(sampled_ns: u64, samples: u64, calls: u64
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn async_block_starts_measurement_on_first_poll() {
-        use std::future::{pending, Future};
-        use std::task::{Context, Waker};
-
-        use crate::functions::{measure_async_block, BlockMeasurement};
-
-        let mut future = std::pin::pin!(measure_async_block("first poll", pending::<()>()));
-        assert!(matches!(
-            future.guard.as_ref().unwrap().0,
-            BlockMeasurement::Unpolled { .. }
-        ));
-        assert!(future
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
-        assert!(matches!(
-            future.guard.as_ref().unwrap().0,
-            BlockMeasurement::Active(_)
-        ));
-    }
-
     use crate::lib_on::functions::function_name;
 
     #[test]

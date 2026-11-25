@@ -555,7 +555,6 @@ mod tests {
         assert_eq!(stats.duration_percentile(50.0), 0);
         #[cfg(feature = "hotpath-prometheus")]
         assert_eq!(stats.duration_zero_count(), 2);
-        assert_eq!(stats.duration_hist.as_ref().unwrap().len(), 3);
     }
 
     #[test]

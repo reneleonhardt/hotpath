@@ -657,120 +657,116 @@ mod tests {
     }
 
     #[test]
-    fn async_block_tracks_macro_hidden_polls() {
-        use std::future::{poll_fn, Future};
+    fn async_blocks_report_only_their_polled_allocations() {
+        use std::alloc::{GlobalAlloc, Layout};
+        use std::future::{pending, poll_fn, Future};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::pin::Pin;
         use std::task::{Context, Poll, Waker};
+
+        fn allocate() {
+            let alloc = hotpath::CountingAllocator::new();
+            let layout = Layout::new::<[u8; 8]>();
+            // SAFETY: the layout is nonzero and the same allocator frees the returned block.
+            unsafe {
+                let ptr = alloc.alloc(layout);
+                assert!(!ptr.is_null());
+                alloc.dealloc(ptr, layout);
+            }
+        }
+
+        fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+            future.poll(&mut Context::from_waker(Waker::noop()))
+        }
 
         macro_rules! hidden_await {
             () => {
-                poll_fn(|_| {
-                    assert_eq!(
-                        crate::functions::alloc::core::ALLOCATIONS.with(|s| s.depth.get()),
-                        1
-                    );
-                    Poll::<()>::Pending
-                })
-                .await
-            };
-        }
-        let mut future = std::pin::pin!(hotpath::measure_block!(
-            "macro hidden async test",
-            async move {
-                hidden_await!();
-            }
-        ));
-        assert!(future
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending());
-        assert_eq!(
-            crate::functions::alloc::core::ALLOCATIONS.with(|s| s.depth.get()),
-            0
-        );
-    }
-
-    #[test]
-    fn measured_await_releases_borrowed_frames_on_unwind() {
-        use std::future::{poll_fn, Future};
-        use std::panic::{catch_unwind, AssertUnwindSafe};
-        use std::task::{Context, Poll, Waker};
-
-        use crate::functions::alloc::core::{track_alloc, ALLOCATIONS};
-        use crate::functions::alloc::guard::{measure_block_await, MeasurementGuardSync};
-
-        let mut guard = MeasurementGuardSync::new("unwinding await", false, false);
-        {
-            let mut pending = true;
-            let inner = poll_fn(|_| {
-                if std::mem::take(&mut pending) {
-                    track_alloc(8);
-                    Poll::<()>::Pending
-                } else {
-                    track_alloc(16);
-                    panic!("poll failed");
-                }
-            });
-            let mut future = std::pin::pin!(measure_block_await(inner, [&mut guard]));
-            let mut cx = Context::from_waker(Waker::noop());
-            assert!(future.as_mut().poll(&mut cx).is_pending());
-            assert!(catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut cx))).is_err());
-        }
-        assert_eq!(ALLOCATIONS.with(|stack| stack.depth.get()), 0);
-        assert!(guard.paused);
-        assert_eq!((guard.bytes, guard.count), (24, 2));
-        std::thread::spawn(move || drop(guard)).join().unwrap();
-    }
-
-    #[test]
-    fn measured_block_releases_allocations_between_polls() {
-        use std::future::{poll_fn, ready, Future};
-        use std::task::{Context, Poll, Waker};
-
-        macro_rules! hidden_await {
-            ($future:expr) => {
-                $future.await
+                pending::<()>().await
             };
         }
 
-        let depth = || crate::functions::alloc::core::ALLOCATIONS.with(|stack| stack.depth.get());
-        for cancel in [false, true] {
-            let mut pending = true;
-            let future = async move {
-                hotpath::measure_block!("block await test", {
-                    assert_eq!(depth(), 1);
-                    hotpath::measure_block!("nested block await test", {
-                        let future = poll_fn(|_| {
-                            assert_eq!(depth(), 2);
-                            if std::mem::take(&mut pending) {
+        let path =
+            std::env::temp_dir().join(format!("hotpath-async-blocks-{}.json", std::process::id()));
+        let profiler = hotpath::HotpathGuardBuilder::new("async blocks")
+            .report("functions-alloc")
+            .functions_limit(0)
+            .format(hotpath::Format::Json)
+            .output_path(&path)
+            .build();
+
+        drop(hotpath::measure_block!("unpolled block", async {
+            allocate()
+        }));
+
+        for (resume, unwind) in [(false, false), (true, false), (true, true)] {
+            let mut future = Box::pin(async move {
+                hotpath::measure_block!("outer block", {
+                    hotpath::measure_block!("nested block", {
+                        let mut first = true;
+                        poll_fn(|_| {
+                            allocate();
+                            if std::mem::take(&mut first) {
                                 Poll::Pending
+                            } else if unwind {
+                                panic!("resumed poll failed");
                             } else {
                                 Poll::Ready(7)
                             }
-                        });
-                        let value = if cancel {
-                            async { hidden_await!(future) }.await
-                        } else {
-                            future.await
-                        };
-                        // Distinct future types and temporaries must work at one site.
-                        ready(&String::from("abc")).await.len() + value
+                        })
+                        .await
                     })
                 })
-            };
-            let mut future = Box::pin(future);
-            let mut cx = Context::from_waker(Waker::noop());
-            assert!(future.as_mut().poll(&mut cx).is_pending());
-            assert_eq!(depth(), 0);
+            });
+            assert_eq!(poll(future.as_mut()), Poll::Pending);
+            allocate();
             std::thread::spawn(move || {
-                if !cancel {
-                    let mut cx = Context::from_waker(Waker::noop());
-                    assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(10));
+                if resume {
+                    if unwind {
+                        assert!(catch_unwind(AssertUnwindSafe(|| poll(future.as_mut()))).is_err());
+                    } else {
+                        assert_eq!(poll(future.as_mut()), Poll::Ready(7));
+                    }
                 }
-                drop(future);
-                assert_eq!(depth(), 0);
             })
             .join()
             .unwrap();
+        }
+
+        let mut hidden = Box::pin(hotpath::measure_block!("hidden await", async {
+            allocate();
+            hidden_await!();
+        }));
+        assert!(poll(hidden.as_mut()).is_pending());
+        allocate();
+        drop(hidden);
+
+        let mut panics = Box::pin(hotpath::measure_block!("panicking poll", async {
+            allocate();
+            panic!("poll failed");
+        }));
+        assert!(catch_unwind(AssertUnwindSafe(|| poll(panics.as_mut()))).is_err());
+        drop(panics);
+        drop(profiler);
+
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let report: crate::json::JsonReport = serde_json::from_slice(&bytes).unwrap();
+        let alloc = report.functions_alloc.unwrap();
+        let count_mode = alloc.profiling_mode == crate::output::ProfilingMode::AllocCount;
+        let data = alloc.data;
+        assert!(!data.iter().any(|row| row.name == "unpolled block"));
+        for (name, calls, bytes, allocations) in [
+            ("nested block", 3, "40 B", "5"),
+            ("hidden await", 1, "8 B", "1"),
+            ("panicking poll", 1, "8 B", "1"),
+        ] {
+            let row = data.iter().find(|row| row.name == name).unwrap();
+            assert_eq!(row.calls, calls);
+            assert_eq!(
+                row.total,
+                if count_mode { allocations } else { bytes },
+                "{name}"
+            );
         }
     }
 }
